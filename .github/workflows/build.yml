@@ -68,11 +68,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lucid-type-${{ matrix.target }}
-          # Installers/archives only — skip the *.blockmap update sidecars.
+          # Installers only — skip *.blockmap sidecars and any archives.
           path: |
             dist-release/Lucid-Type-*.dmg
             dist-release/Lucid-Type-*.exe
-            dist-release/Lucid-Type-*.zip
           if-no-files-found: ignore
 
   release:
@@ -96,5 +95,4 @@ jobs:
           files: |
             artifacts/**/Lucid-Type-*.dmg
             artifacts/**/Lucid-Type-*.exe
-            artifacts/**/Lucid-Type-*.zip
           fail_on_unmatched_files: false
