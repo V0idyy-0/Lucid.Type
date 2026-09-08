@@ -66,8 +66,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lucid-type-${{ matrix.target }}
+          # Installers/archives only — skip the *.blockmap update sidecars.
           path: |
-            dist-release/Lucid-Type-*.*
+            dist-release/Lucid-Type-*.dmg
+            dist-release/Lucid-Type-*.exe
+            dist-release/Lucid-Type-*.zip
           if-no-files-found: ignore
 
   release:
@@ -88,5 +91,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Lucid Type ${{ github.ref_name }}
-          files: artifacts/**/Lucid-Type-*.*
+          files: |
+            artifacts/**/Lucid-Type-*.dmg
+            artifacts/**/Lucid-Type-*.exe
+            artifacts/**/Lucid-Type-*.zip
           fail_on_unmatched_files: false
