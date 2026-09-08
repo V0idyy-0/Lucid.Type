@@ -1,0 +1,42 @@
+.pill-stage {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  /* the whole window surface drags the frameless pill */
+  -webkit-app-region: drag;
+}
+
+.pill {
+  /* `--accent` is set on :root from user settings (see App.tsx / index.css) */
+  -webkit-app-region: no-drag;
+  appearance: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px 7px 12px;
+  border-radius: 999px;
+  color: #f4f6ff;
+  font: 500 13px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  background: rgba(18, 20, 32, 0.72);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, rgba(255, 255, 255, 0.12));
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  box-shadow:
+    0 8px 30px rgba(8, 10, 24, 0.4),
+    0 0 18px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.pill:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 80%, white);
+  outline-offset: 3px;
+}
+
+.pill__text {
+  letter-spacing: 0.01em;
+  opacity: 0.85;
+}

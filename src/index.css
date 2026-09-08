@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+/* Target native font rendering per OS */
+:root {
+  /* pill accent colour; overwritten at runtime from persisted settings */
+  --accent: #3b82f6;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  /* transparent so the Electron window shows only the floating pill */
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* macOS System Font Stack */
+.platform-mac {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+               "Helvetica Neue", Arial, sans-serif;
+  user-select: none;
+}
+
+/* Windows 11 Segoe UI Font Stack */
+.platform-win {
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", sans-serif;
+  user-select: none;
+}
+
+/* Hide scrollbars for a native utility feel */
+::-webkit-scrollbar {
+  display: none;
+}
