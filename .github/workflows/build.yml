@@ -10,12 +10,21 @@ on:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            target: macos
+            eb_flags: ""
+          - os: windows-latest
+            target: windows-x64
+            eb_flags: "--x64"
+          - os: windows-11-arm
+            target: windows-arm64
+            eb_flags: "--arm64"
 
     steps:
       - name: Checkout
@@ -40,6 +49,7 @@ jobs:
         run: npm run fetch:model
 
       - name: Lint
+        if: matrix.target == 'macos'
         run: npm run lint
 
       - name: Build renderer and main process
@@ -48,14 +58,14 @@ jobs:
           npm run build:electron
 
       - name: Package Lucid Type
-        run: npx electron-builder --publish never
+        run: npx electron-builder --publish never ${{ matrix.eb_flags }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Lucid Type artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lucid-type-${{ matrix.os }}
+          name: lucid-type-${{ matrix.target }}
           path: |
             dist-release/Lucid-Type-*.*
           if-no-files-found: ignore
