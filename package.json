@@ -15,12 +15,14 @@
     "electron:start": "npm run build && npm run build:electron && electron .",
     "predist": "node scripts/fetch-model.mjs",
     "dist": "npm run build && npm run build:electron && electron-builder",
+    "build:win": "npm run build && npm run build:electron && electron-builder --win",
     "lint": "oxlint",
     "preview": "vite preview"
   },
   "build": {
     "appId": "com.lucidtype.app",
     "productName": "Lucid Type",
+    "executableName": "Lucid Type",
     "artifactName": "Lucid-Type-${version}-${os}-${arch}.${ext}",
     "directories": {
       "output": "dist-release"
@@ -41,6 +43,11 @@
       "target": [
         "nsis"
       ]
+    },
+    "nsis": {
+      "shortcutName": "Lucid Type",
+      "uninstallDisplayName": "Lucid Type",
+      "artifactName": "Lucid-Type-${version}-${os}-${arch}.${ext}"
     },
     "linux": {
       "target": [
