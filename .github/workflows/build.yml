@@ -73,6 +73,9 @@ jobs:
             dist-release/Lucid-Type-*.dmg
             dist-release/Lucid-Type-*.exe
           if-no-files-found: ignore
+          # Only needed to hand off to the release job in the same run.
+          retention-days: 1
+          compression-level: 0
 
   release:
     name: Release Lucid Type

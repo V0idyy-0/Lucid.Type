@@ -9,13 +9,24 @@ lerna-debug.log*
 
 node_modules
 dist
+dist/
 dist-electron
 dist-release
+dist-release/
+dist_release/
 dist-ssr
 *.local
 
 # Whisper model — ~142 MB, fetched by scripts/fetch-model.mjs (npm postinstall)
 bin/models/*.bin
+
+# Packaged installers — never commit; CI publishes them to GitHub Releases
+*.dmg
+*.exe
+*.zip
+
+# Local tooling / agent state
+.claude/
 
 # Nested reference clone, not part of this project
 whisper-flow-clone/
