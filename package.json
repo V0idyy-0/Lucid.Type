@@ -23,6 +23,7 @@
     "appId": "com.lucidtype.app",
     "productName": "Lucid Type",
     "executableName": "Lucid Type",
+    "icon": "build/icon.png",
     "artifactName": "Lucid-Type-${version}-${os}-${arch}.${ext}",
     "directories": {
       "output": "dist-release"
