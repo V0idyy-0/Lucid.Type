@@ -22,7 +22,7 @@
   "build": {
     "appId": "com.lucidtype.app",
     "productName": "Lucid Type",
-    "executableName": "Lucid Type",
+    "executableName": "lucid-type",
     "icon": "build/icon.png",
     "artifactName": "Lucid-Type-${version}-${os}-${arch}.${ext}",
     "directories": {
@@ -48,8 +48,10 @@
       ]
     },
     "nsis": {
+      "oneClick": true,
       "shortcutName": "Lucid Type",
       "uninstallDisplayName": "Lucid Type",
+      "deleteAppDataOnUninstall": true,
       "artifactName": "Lucid-Type-${version}-${os}-${arch}.${ext}"
     },
     "linux": {
