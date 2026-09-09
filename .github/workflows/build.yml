@@ -64,7 +64,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Only upload on a tag build — that's the only run that publishes a
+      # release. Branch/PR builds still compile + package to catch breakage,
+      # but store nothing.
       - name: Upload Lucid Type artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: lucid-type-${{ matrix.target }}
