@@ -36,11 +36,13 @@
       "bin/**/*"
     ],
     "mac": {
+      "icon": "build/icon.png",
       "target": [
         "dmg"
       ]
     },
     "win": {
+      "icon": "build/icon.png",
       "target": [
         "nsis"
       ]

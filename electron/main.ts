@@ -314,6 +314,12 @@ async function triggerSystemPaste(text: string): Promise<void> {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
+/** App icon for the BrowserWindows. Present in dev and when running from an
+ *  unpacked build; in a packaged app the window icon comes from the .app
+ *  bundle / .exe resources electron-builder stamps from `build.*.icon`, and a
+ *  missing path here is simply ignored. */
+const APP_ICON = path.join(__dirname, '../build/icon.png')
+
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
 
 /** Project root — the directory that holds `bin/`, `package.json`, `dist/`. */
@@ -396,6 +402,7 @@ function createWindow() {
     width: OVERLAY_WIDTH,
     height: OVERLAY_HEIGHT,
     title: 'Lucid Type',
+    icon: APP_ICON,
     show: false,
     frame: false,
     transparent: true,
@@ -831,6 +838,7 @@ function openSettings(): void {
     fullscreenable: false,
     show: false,
     title: 'Lucid Type Settings',
+    icon: APP_ICON,
     // On macOS let the sidebar vibrancy show through the transparent body; on
     // Windows keep the opaque dark backdrop.
     backgroundColor: mac ? '#00000000' : '#0e0f17',
@@ -1017,6 +1025,10 @@ async function rateLimitedTranscribe(wavBytes: Uint8Array): Promise<TranscribeRe
 
 app.whenReady().then(() => {
   store = new Store<Settings>({ defaults: DEFAULT_SETTINGS })
+
+  // Windows: group the app's windows and notifications under a stable identity
+  // (must match electron-builder's appId) rather than the default per-exe one.
+  app.setAppUserModelId('com.lucidtype.app')
 
   // A menu-bar / system-tray resident app — no dock icon on macOS.
   if (process.platform === 'darwin') app.dock?.hide()
