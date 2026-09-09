@@ -63,6 +63,58 @@ function sanitizeTranscript(text: string): string {
     .trim()
 }
 
+/** Hard ceiling on transcript length before it reaches the clipboard or a
+ *  synthetic paste. No real dictation take comes close; this just bounds a
+ *  pathological whisper-cli or Ollama response. */
+const MAX_TRANSCRIPT_CHARS = 100_000
+
+/** ESC + "[" … CSI escape sequence, built without a literal control byte in
+ *  the source so the regex stays lint-clean. */
+const CSI_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;:?]*[ -/]*[@-~]`, 'g')
+
+/**
+ * Strip everything from a transcript that has no business surviving a trip to
+ * the clipboard or a synthetic paste into the user's editor or terminal:
+ *
+ *  - ANSI / VT (CSI) escape sequences,
+ *  - NUL and every other C0/C1 control byte (tab and newline are kept; CR and
+ *    CRLF are normalised to "\n"),
+ *  - zero-width, BOM, and Unicode bidirectional-control characters,
+ *  - the Unicode line/paragraph separators (U+2028 / U+2029 → newline).
+ *
+ * The result is clamped to {@link MAX_TRANSCRIPT_CHARS}. whisper-cli and a
+ * local Ollama both *should* only ever emit plain prose — this is the guard
+ * that doesn't rely on it.
+ */
+function scrubText(text: string): string {
+  const normalized = text.normalize('NFC').replace(/\r\n?/g, '\n').replace(CSI_SEQUENCE, '')
+
+  let out = ''
+  for (const ch of normalized) {
+    if (out.length >= MAX_TRANSCRIPT_CHARS) break
+    const c = ch.codePointAt(0) as number
+
+    if (c === 0x09 || c === 0x0a) {
+      out += ch // keep tab and newline
+    } else if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) {
+      // drop C0 / C1 control characters
+    } else if (c === 0x2028 || c === 0x2029) {
+      out += '\n' // Unicode line / paragraph separator
+    } else if (
+      c === 0xfeff ||
+      (c >= 0x200b && c <= 0x200f) || // zero-width + LTR/RTL marks
+      (c >= 0x202a && c <= 0x202e) || // bidi embeddings / overrides
+      (c >= 0x2060 && c <= 0x2064) || // word joiner + invisible operators
+      (c >= 0x2066 && c <= 0x206f) // bidi isolates + deprecated format chars
+    ) {
+      // drop zero-width / BOM / bidirectional-control characters
+    } else {
+      out += ch
+    }
+  }
+  return out
+}
+
 /** Local Ollama endpoint used for the optional "AI Text Polish" pass. */
 const OLLAMA_URL = 'http://localhost:11434/api/generate'
 const OLLAMA_MODEL = 'llama3.2:1b'
@@ -136,7 +188,9 @@ async function polishTranscript(raw: string, activeAppName?: string): Promise<st
     })
     if (!res.ok) return null
     const data = (await res.json()) as { response?: unknown }
-    const polished = typeof data.response === 'string' ? data.response.trim() : ''
+    // Don't trust the local model's output shape: scrub control/format
+    // characters and clamp the length before it re-enters the pipeline.
+    const polished = typeof data.response === 'string' ? scrubText(data.response).trim() : ''
     return polished || null
   } catch {
     // Ollama not running, aborted by the timeout, or a malformed response.
@@ -848,11 +902,13 @@ async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
     }
 
     const raw = await readFile(txtPath, 'utf8')
-    const joined = raw
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .join(' ')
+    const joined = scrubText(
+      raw
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join(' '),
+    )
 
     const { autoPaste, stripFillerWords, useLlmPolish } = settings()
 
@@ -883,6 +939,10 @@ async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
         polish = 'fallback'
       }
     }
+
+    // Final guard: whatever cleaner/polish path produced `text`, nothing
+    // untrusted reaches the clipboard or a synthetic paste unscrubbed.
+    text = scrubText(text)
 
     if (text) {
       if (autoPaste) await triggerSystemPaste(text)

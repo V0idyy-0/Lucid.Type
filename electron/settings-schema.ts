@@ -49,7 +49,15 @@ export function sanitizeSettings(patch: Partial<Settings> | null | undefined): P
   const out: Partial<Settings> = {}
   if (!patch || typeof patch !== 'object') return out
 
-  if (typeof patch.hotkey === 'string' && patch.hotkey.trim()) {
+  // An Electron accelerator is a short "+"-joined list of ASCII key tokens.
+  // Reject anything outside that shape so junk never reaches globalShortcut or
+  // the persisted store; the renderer already runs a fuller validateShortcut().
+  if (
+    typeof patch.hotkey === 'string' &&
+    patch.hotkey.trim() &&
+    patch.hotkey.trim().length <= 80 &&
+    /^[A-Za-z0-9 +]+$/.test(patch.hotkey.trim())
+  ) {
     out.hotkey = patch.hotkey.trim()
   }
   if (patch.dictationMode === 'toggle' || patch.dictationMode === 'ptt') {
