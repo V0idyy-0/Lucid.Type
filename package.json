@@ -39,7 +39,10 @@
       "icon": "build/icon.png",
       "target": [
         "dmg"
-      ]
+      ],
+      "identity": "-",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
     },
     "win": {
       "icon": "build/icon.png",

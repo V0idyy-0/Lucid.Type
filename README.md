@@ -50,9 +50,13 @@ Grab the latest build from the
 | Windows (x64) | `Lucid-Type-<version>-win-x64.exe` |
 | Windows (ARM64) | `Lucid-Type-<version>-win-arm64.exe` |
 
-> **Note:** builds are currently **unsigned**. macOS will need
-> *right‑click → Open* the first time (Gatekeeper); Windows will show a
-> SmartScreen prompt (*More info → Run anyway*).
+> **Note:** builds are **ad‑hoc signed, not notarized**.
+>
+> - **macOS:** the first launch is blocked by Gatekeeper. Right‑click the app →
+>   *Open* → *Open*, or allow it under *System Settings → Privacy & Security*.
+>   If macOS still calls it *"damaged"*, clear the download quarantine:
+>   `xattr -dr com.apple.quarantine /Applications/lucid-type.app`
+> - **Windows:** SmartScreen shows a warning — *More info → Run anyway*.
 
 ### Prerequisites
 
