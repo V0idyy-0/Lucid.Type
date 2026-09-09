@@ -55,7 +55,7 @@ Grab the latest build from the
 > - **macOS:** the first launch is blocked by Gatekeeper. Right‑click the app →
 >   *Open* → *Open*, or allow it under *System Settings → Privacy & Security*.
 >   If macOS still calls it *"damaged"*, clear the download quarantine:
->   `xattr -dr com.apple.quarantine /Applications/lucid-type.app`
+>   `xattr -dr com.apple.quarantine "/Applications/Lucid Type.app"`
 > - **Windows:** SmartScreen shows a warning — *More info → Run anyway*.
 
 ### Prerequisites

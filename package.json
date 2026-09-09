@@ -22,7 +22,6 @@
   "build": {
     "appId": "com.lucidtype.app",
     "productName": "Lucid Type",
-    "executableName": "lucid-type",
     "icon": "build/icon.png",
     "artifactName": "Lucid-Type-${version}-${os}-${arch}.${ext}",
     "directories": {
@@ -51,7 +50,13 @@
       ]
     },
     "nsis": {
-      "oneClick": true,
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "menuCategory": false,
+      "runAfterFinish": true,
       "shortcutName": "Lucid Type",
       "uninstallDisplayName": "Lucid Type",
       "deleteAppDataOnUninstall": true,
