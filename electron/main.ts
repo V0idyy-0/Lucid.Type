@@ -894,6 +894,67 @@ async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
   }
 }
 
+// ── Transcription rate limiting ──────────────────────────────────────────────
+//
+// `transcribe` shells out to whisper-cli, which pins a core for the length of
+// the decode. Nothing metered or billable runs here — this guard exists purely
+// so a wedged renderer, a second window, or a runaway caller can't stampede the
+// CPU with overlapping decode processes.
+
+/** Largest WAV we'll accept from the renderer. 16 kHz mono 16-bit is ~32 KB/s,
+ *  so this is roughly 45 minutes — a bigger payload is a bug, not a take. */
+const MAX_WAV_BYTES = 90 * 1024 * 1024
+/** How many requests may wait behind the running decode before we start
+ *  rejecting. The renderer already blocks a second take while one is in flight,
+ *  so a backlog past this means something is misbehaving. */
+const MAX_TRANSCRIBE_QUEUE = 2
+/** Idle gap forced between one decode finishing and the next starting, so a
+ *  burst of requests can't keep whisper-cli pegged back-to-back. */
+const TRANSCRIBE_COOLDOWN_MS = 400
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Tail of the decode chain; every request awaits this before it runs, which
+ *  serialises them so only one whisper-cli process is ever alive. */
+let transcribeChain: Promise<unknown> = Promise.resolve()
+/** Requests accepted but not yet started — the backlog the queue cap limits. */
+let transcribeQueued = 0
+let lastTranscribeFinishedAt = 0
+
+/**
+ * Gate {@link transcribe}: one decode at a time, a bounded queue, a short
+ * cooldown between takes, and a sanity check on the payload size. Throws a plain
+ * Error (surfaced to the renderer as a failed transcription) when the queue is
+ * full or the WAV is implausibly large.
+ */
+async function rateLimitedTranscribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
+  const size = (wavBytes as { byteLength?: number } | null | undefined)?.byteLength ?? 0
+  if (size === 0) throw new Error('No audio received')
+  if (size > MAX_WAV_BYTES) throw new Error('Recording is too long to transcribe')
+
+  if (transcribeQueued >= MAX_TRANSCRIBE_QUEUE) {
+    console.warn(`transcribe-audio: ${transcribeQueued} already queued — rejecting request`)
+    throw new Error('Transcription is busy — try again in a moment')
+  }
+
+  transcribeQueued++
+  const run = transcribeChain
+    .catch(() => {}) // a failed decode must not break the chain for the next one
+    .then(async () => {
+      transcribeQueued--
+      const idle = Date.now() - lastTranscribeFinishedAt
+      if (idle < TRANSCRIBE_COOLDOWN_MS) await delay(TRANSCRIBE_COOLDOWN_MS - idle)
+      try {
+        return await transcribe(wavBytes)
+      } finally {
+        lastTranscribeFinishedAt = Date.now()
+      }
+    })
+
+  transcribeChain = run
+  return run
+}
+
 app.whenReady().then(() => {
   store = new Store<Settings>({ defaults: DEFAULT_SETTINGS })
 
@@ -906,7 +967,7 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('transcribe-audio', async (_event, wavBytes: Uint8Array) => {
-    return transcribe(wavBytes)
+    return rateLimitedTranscribe(wavBytes)
   })
 
   // Settings bridge for the renderer.
