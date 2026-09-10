@@ -5,6 +5,8 @@
   "version": "1.0.0",
   "type": "module",
   "main": "dist-electron/main.js",
+  "author": "V0idyy-0",
+  "repository": "github:V0idyy-0/Lucid.Type",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

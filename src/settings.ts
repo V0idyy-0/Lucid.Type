@@ -9,6 +9,13 @@
  */
 export type DictationMode = 'toggle' | 'ptt'
 
+/** A literal find/replace applied to every finished transcript. */
+export type Replacement = { from: string; to: string }
+
+/** Whisper model ids Lucid Type can run. All English-only for now. */
+export const MODEL_IDS = ['tiny.en', 'base.en', 'small.en'] as const
+export type ModelId = (typeof MODEL_IDS)[number]
+
 export type Settings = {
   /** Global accelerator that reveals the pill and toggles dictation. */
   hotkey: string
@@ -28,6 +35,20 @@ export type Settings = {
   accentColor: string
   /** Play a short start/stop chime when recording toggles. */
   soundEffects: boolean
+  /** Whisper model to decode with. Larger = more accurate, slower. */
+  model: ModelId
+  /** Keep a local log of finished transcripts (off by default — privacy-first). */
+  saveHistory: boolean
+  /** How many history entries to keep before the oldest are dropped. */
+  historyLimit: number
+  /** Proper nouns / jargon / acronyms fed to whisper as a recognition hint. */
+  vocabulary: string[]
+  /** Literal find/replace rules applied to every finished transcript. */
+  replacements: Replacement[]
+  /** Start Lucid Type automatically when the user logs into their computer. */
+  launchAtLogin: boolean
+  /** Check GitHub for a newer release on startup and once a day. */
+  autoCheckUpdates: boolean
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -38,6 +59,13 @@ export const DEFAULT_SETTINGS: Settings = {
   useLlmPolish: false,
   accentColor: '#3b82f6',
   soundEffects: true,
+  model: 'base.en',
+  saveHistory: false,
+  historyLimit: 100,
+  vocabulary: [],
+  replacements: [],
+  launchAtLogin: true,
+  autoCheckUpdates: true,
 }
 
 /** Preset accent colours offered in the Settings modal. */

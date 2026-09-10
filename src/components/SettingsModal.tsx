@@ -11,8 +11,11 @@ import {
   ACCENT_SWATCHES,
   DEFAULT_SETTINGS,
   type DictationMode,
+  type ModelId,
+  type Replacement,
   type Settings,
 } from '../settings'
+import type { ModelDownloadProgress, ModelStatus } from '../whisper-flow'
 import { validateShortcut } from '../utils/shortcutValidator'
 
 const isMac = typeof navigator !== 'undefined' && navigator.userAgent.includes('Mac')
@@ -165,6 +168,12 @@ const TAB_ICON_PATHS: Record<TabId, ReactNode> = {
       <path d="M5 18H3" />
     </>
   ),
+  vocabulary: (
+    <>
+      <path d="M12 7v14" />
+      <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+    </>
+  ),
   appearance: (
     <>
       <circle cx="13.5" cy="6.5" r=".5" fill="currentColor" />
@@ -198,6 +207,7 @@ function TabIcon({ id }: { id: TabId }) {
 const TABS = [
   { id: 'general', label: 'General' },
   { id: 'shortcuts', label: 'Shortcuts' },
+  { id: 'vocabulary', label: 'Vocabulary' },
   { id: 'models', label: 'AI & Models' },
   { id: 'appearance', label: 'Appearance' },
 ] as const
@@ -310,6 +320,122 @@ function PillPreview({ accent }: { accent: string }) {
   )
 }
 
+/**
+ * Vocabulary + find/replace editor. Keeps its edits in local state and only
+ * pushes them to the store on blur, so a controlled `<textarea>` doesn't fight
+ * the user's cursor on every keystroke.
+ */
+function VocabularyPanel({
+  vocabulary,
+  replacements,
+  commit,
+}: {
+  vocabulary: string[]
+  replacements: Replacement[]
+  commit: (patch: Partial<Settings>) => void
+}) {
+  const [text, setText] = useState(vocabulary.join('\n'))
+  const [rows, setRows] = useState<Replacement[]>(replacements)
+
+  // Re-sync when the stored value changes from elsewhere (another window, a
+  // reset) — the render-phase "adjust state when a prop changes" pattern, so a
+  // blur-commit round-trip doesn't stomp what the user is mid-edit.
+  const [syncedVocab, setSyncedVocab] = useState(vocabulary)
+  if (vocabulary !== syncedVocab) {
+    setSyncedVocab(vocabulary)
+    setText(vocabulary.join('\n'))
+  }
+  const [syncedRules, setSyncedRules] = useState(replacements)
+  if (replacements !== syncedRules) {
+    setSyncedRules(replacements)
+    setRows(replacements)
+  }
+
+  const commitVocab = () => {
+    const terms = text
+      .split('\n')
+      .map((t) => t.trim())
+      .filter(Boolean)
+    commit({ vocabulary: terms })
+  }
+
+  const commitRows = (next: Replacement[]) => {
+    setRows(next)
+    commit({ replacements: next.filter((r) => r.from.trim()) })
+  }
+
+  const inputClass =
+    'min-w-0 flex-1 rounded-md border border-white/10 bg-[#323234] px-2 py-1 text-[12px] text-[#e1e1e1] outline-none placeholder:text-zinc-600 focus:border-white/25'
+
+  return (
+    <>
+      <CategoryLabel>Spelling hints</CategoryLabel>
+      <p className="pb-2 text-[11px] leading-relaxed text-zinc-500">
+        Names, jargon, and acronyms you want recognised. One per line — Lucid Type feeds them to
+        whisper as a hint.
+      </p>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commitVocab}
+        spellCheck={false}
+        rows={6}
+        placeholder={'Kubernetes\nGraphQL\nNaledi'}
+        className="w-full resize-y rounded-[10px] border border-white/[0.08] bg-[#28282b] p-3 font-mono text-[12px] leading-relaxed text-zinc-100 outline-none focus:border-white/25"
+      />
+
+      <CategoryLabel>Replacements</CategoryLabel>
+      <p className="pb-2 text-[11px] leading-relaxed text-zinc-500">
+        Rewrite finished text — expand shorthand, fix a spelling whisper always gets wrong. Matching
+        is case-insensitive.
+      </p>
+      <div className="flex flex-col gap-2">
+        {rows.map((row, i) => (
+          <div key={i} className="flex items-center gap-2" style={NO_DRAG}>
+            <input
+              value={row.from}
+              onChange={(e) =>
+                setRows(rows.map((r, j) => (j === i ? { ...r, from: e.target.value } : r)))
+              }
+              onBlur={() => commitRows(rows)}
+              placeholder="heard this"
+              className={inputClass}
+            />
+            <span aria-hidden className="text-zinc-600">
+              →
+            </span>
+            <input
+              value={row.to}
+              onChange={(e) =>
+                setRows(rows.map((r, j) => (j === i ? { ...r, to: e.target.value } : r)))
+              }
+              onBlur={() => commitRows(rows)}
+              placeholder="write this"
+              className={inputClass}
+            />
+            <button
+              type="button"
+              aria-label="Remove replacement"
+              onClick={() => commitRows(rows.filter((_, j) => j !== i))}
+              className="shrink-0 rounded-md px-1.5 py-1 text-zinc-500 transition-colors hover:bg-white/10 hover:text-red-400"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+        <button
+          type="button"
+          style={NO_DRAG}
+          onClick={() => setRows([...rows, { from: '', to: '' }])}
+          className="self-start rounded-md border border-white/10 bg-[#323234] px-2.5 py-1 text-[12px] text-zinc-300 transition-colors hover:bg-[#3d3d40]"
+        >
+          Add replacement
+        </button>
+      </div>
+    </>
+  )
+}
+
 export default function SettingsModal() {
   // Outside Electron (e.g. plain Vite) there's nothing to load — fall straight
   // back to the defaults so the window still renders.
@@ -321,11 +447,25 @@ export default function SettingsModal() {
   const [shortcutError, setShortcutError] = useState<string | null>(null)
   const captureBtnRef = useRef<HTMLButtonElement>(null)
 
+  const [models, setModels] = useState<ModelStatus[]>([])
+  const [download, setDownload] = useState<ModelDownloadProgress | null>(null)
+  const [version, setVersion] = useState('')
+
   useEffect(() => {
     const api = window.whisperFlow
     if (!api) return
     void api.getSettings().then(setSettings)
-    return api.onSettingsChanged(setSettings)
+    void api.listModels().then(setModels)
+    void api.getVersion().then(setVersion)
+    const offSettings = api.onSettingsChanged(setSettings)
+    const offProgress = api.onModelDownloadProgress((p) => {
+      setDownload(p.done && !p.error ? null : p)
+      if (p.done) void api.listModels().then(setModels)
+    })
+    return () => {
+      offSettings()
+      offProgress()
+    }
   }, [])
 
   // Every interaction persists straight to electron-store; there's no Save step.
@@ -333,6 +473,36 @@ export default function SettingsModal() {
     setSettings((prev) => (prev ? { ...prev, ...patch } : prev))
     void window.whisperFlow?.updateSettings(patch)
   }, [])
+
+  const chooseModel = useCallback(
+    (id: ModelId) => {
+      const status = models.find((m) => m.id === id)
+      if (status && !status.downloaded) {
+        // Download first; only switch to it once the file is actually on disk
+        // (until then transcription would fall back to base.en anyway).
+        setDownload({ id, received: 0, total: 0 })
+        void window.whisperFlow
+          ?.downloadModel(id)
+          .then((list) => {
+            setModels(list)
+            setDownload(null)
+            commit({ model: id })
+          })
+          .catch((err: unknown) => {
+            setDownload({
+              id,
+              received: 0,
+              total: 0,
+              done: true,
+              error: err instanceof Error ? err.message : 'Download failed',
+            })
+          })
+        return
+      }
+      commit({ model: id })
+    },
+    [models, commit],
+  )
 
   const close = useCallback(() => {
     if (window.whisperFlow) window.whisperFlow.closeSettings()
@@ -480,6 +650,90 @@ export default function SettingsModal() {
                   />
                 </CardRow>
               </Card>
+
+              <CategoryLabel>History</CategoryLabel>
+              <Card>
+                <CardRow
+                  title="Save dictation history"
+                  hint="Keep a local log of finished transcripts. Nothing leaves your machine."
+                >
+                  <Toggle
+                    label="Save dictation history"
+                    checked={settings.saveHistory}
+                    accent={accent}
+                    onChange={(v) => commit({ saveHistory: v })}
+                  />
+                </CardRow>
+                <CardRow title="Keep the last" hint="Older entries are dropped automatically">
+                  <select
+                    style={NO_DRAG}
+                    value={settings.historyLimit}
+                    onChange={(e) => commit({ historyLimit: Number(e.target.value) })}
+                    aria-label="History entries to keep"
+                    className={selectClass}
+                    disabled={!settings.saveHistory}
+                  >
+                    {[25, 50, 100, 250, 500].map((n) => (
+                      <option key={n} value={n}>
+                        {n} entries
+                      </option>
+                    ))}
+                  </select>
+                </CardRow>
+                <CardRow title="Dictation history" hint="Open the log, or wipe it">
+                  <span className="flex gap-2" style={NO_DRAG}>
+                    <button
+                      type="button"
+                      onClick={() => window.whisperFlow?.openHistory()}
+                      className={selectClass}
+                    >
+                      Open
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void window.whisperFlow?.clearHistory()}
+                      className="cursor-pointer rounded-md border border-white/10 bg-[#323234] px-2 py-1 text-[12px] text-zinc-300 transition-colors hover:bg-[#3d3d40] hover:text-red-400"
+                    >
+                      Clear
+                    </button>
+                  </span>
+                </CardRow>
+              </Card>
+
+              <CategoryLabel>Startup &amp; updates</CategoryLabel>
+              <Card>
+                <CardRow
+                  title="Launch at login"
+                  hint="Start Lucid Type in the menu bar when you log in — no window, no relaunch"
+                >
+                  <Toggle
+                    label="Launch at login"
+                    checked={settings.launchAtLogin}
+                    accent={accent}
+                    onChange={(v) => commit({ launchAtLogin: v })}
+                  />
+                </CardRow>
+                <CardRow
+                  title="Automatically check for updates"
+                  hint="Check GitHub for a newer release on launch and once a day"
+                >
+                  <Toggle
+                    label="Automatically check for updates"
+                    checked={settings.autoCheckUpdates}
+                    accent={accent}
+                    onChange={(v) => commit({ autoCheckUpdates: v })}
+                  />
+                </CardRow>
+                <CardRow title="Version" hint={version ? `Lucid Type ${version}` : 'Lucid Type'}>
+                  <button
+                    type="button"
+                    onClick={() => window.whisperFlow?.openAbout()}
+                    className={selectClass}
+                  >
+                    About…
+                  </button>
+                </CardRow>
+              </Card>
             </>
           )}
 
@@ -558,8 +812,71 @@ export default function SettingsModal() {
             </>
           )}
 
+          {tab === 'vocabulary' && (
+            <VocabularyPanel
+              vocabulary={settings.vocabulary}
+              replacements={settings.replacements}
+              commit={commit}
+            />
+          )}
+
           {tab === 'models' && (
             <>
+              <CategoryLabel>Speech model</CategoryLabel>
+              <Card>
+                <CardRow
+                  title="Whisper model"
+                  hint="Larger models are more accurate but slower to transcribe"
+                  align="start"
+                >
+                  <select
+                    style={NO_DRAG}
+                    value={settings.model}
+                    onChange={(e) => chooseModel(e.target.value as ModelId)}
+                    aria-label="Whisper model"
+                    className={selectClass}
+                    disabled={!!download && !download.error}
+                  >
+                    {(models.length
+                      ? models
+                      : [{ id: settings.model, label: settings.model, downloaded: true, sizeMB: 0 }]
+                    ).map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                        {m.sizeMB ? ` — ${m.sizeMB} MB` : ''}
+                        {m.downloaded ? '' : ' (download)'}
+                      </option>
+                    ))}
+                  </select>
+                </CardRow>
+              </Card>
+              {download && !download.error && (
+                <div className="pt-3">
+                  <div className="mb-1 flex justify-between text-[11px] text-zinc-500">
+                    <span>Downloading {download.id}…</span>
+                    {download.total > 0 && (
+                      <span>{Math.round((download.received / download.total) * 100)}%</span>
+                    )}
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full transition-[width] duration-200"
+                      style={{
+                        backgroundColor: accent,
+                        width: download.total
+                          ? `${(download.received / download.total) * 100}%`
+                          : '35%',
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+              {download?.error && (
+                <p className="pt-2 text-xs text-red-400" role="alert">
+                  {download.error}
+                </p>
+              )}
+
               <CategoryLabel>AI Text Polish</CategoryLabel>
               <Card>
                 <CardRow

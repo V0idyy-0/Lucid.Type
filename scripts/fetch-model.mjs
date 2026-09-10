@@ -8,8 +8,12 @@
  * packaging build all end up with the model in place without anyone having to
  * fetch it by hand.
  *
- * Override the source with WHISPER_MODEL_URL; skip entirely with
+ * Fetch a different model with WHISPER_MODEL (e.g. `ggml-small.en.bin`);
+ * override the source with WHISPER_MODEL_URL; skip entirely with
  * SKIP_MODEL_DOWNLOAD=1 (useful for offline installs that bring their own copy).
+ *
+ * Note: the app also downloads models on demand at runtime (into userData/),
+ * so this script only needs to cover the one bundled into packaged builds.
  */
 import { createWriteStream } from 'node:fs'
 import { mkdir, rename, stat, unlink } from 'node:fs/promises'
@@ -20,14 +24,15 @@ import { pipeline } from 'node:stream/promises'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const MODEL_DIR = join(ROOT, 'bin', 'models')
-const MODEL_NAME = 'ggml-base.en.bin'
+const MODEL_NAME = process.env.WHISPER_MODEL || 'ggml-base.en.bin'
 const MODEL_PATH = join(MODEL_DIR, MODEL_NAME)
 const MODEL_URL =
   process.env.WHISPER_MODEL_URL ||
   `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${MODEL_NAME}`
 
-/** ~142 MB — anything much smaller is a truncated download or an error page. */
-const MIN_BYTES = 100 * 1024 * 1024
+/** Smallest plausible model file (ggml-tiny is ~75 MB) — anything under this is
+ *  a truncated download or an HTML error page. */
+const MIN_BYTES = 60 * 1024 * 1024
 
 async function fileSize(path) {
   try {

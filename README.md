@@ -12,9 +12,15 @@ the way.
 ## Features
 
 - **On‑device transcription** — whisper.cpp with the bundled `ggml-base.en`
-  model. Works offline.
+  model. Works offline. Switch to `tiny.en` (faster) or `small.en` (more
+  accurate) from Settings — extra models download on demand.
 - **Two trigger modes** — *toggle* (tap to start, tap to stop) or *push‑to‑talk*
-  (hold the key, release to transcribe).
+  (hold the key, release to transcribe). Press **Esc** while recording to throw
+  the take away.
+- **Custom vocabulary** — teach it the names, jargon, and acronyms it keeps
+  mis‑hearing, plus your own find/replace rules applied to every transcript.
+- **Dictation history** — an optional local log of finished transcripts (off by
+  default; nothing leaves your machine). Open it from the tray.
 - **Auto‑paste** — the transcript is typed into the focused app the moment you
   finish, then your previous clipboard contents are restored.
 - **Optional AI polish** — routes the raw transcript through a locally‑running
@@ -26,6 +32,9 @@ the way.
   removes non‑verbal artefacts (“\[coughing]”), and drops the phrases whisper
   tends to hallucinate over silence (“thanks for watching”).
 - **Silence gate** — near‑silent takes are discarded instead of transcribed.
+- **Menu‑bar native** — launches at login (on by default, toggle in Settings or
+  the tray), checks GitHub for a newer release on startup, and has an About
+  window with a manual *Check for updates*.
 - **Customisable** — global hotkey, trigger mode, accent colour, start/stop
   chime.
 
@@ -91,6 +100,11 @@ Grab the latest build from the
 | Hotkey | `Alt+Space` | Global shortcut; must include a modifier or be a function key |
 | Auto‑paste transcript | On | Paste into the focused app as soon as dictation ends |
 | Strip filler words | On | Remove “um”, “uh”, “like”, “you know” |
+| Whisper model | `base.en` | `tiny.en` / `base.en` / `small.en` — bigger is slower but sharper |
+| Vocabulary & replacements | — | Spelling hints for whisper + literal find/replace on the output |
+| Save dictation history | Off | Keep a local, on‑device log of finished transcripts |
+| Launch at login | On | Start Lucid Type in the menu bar when you log in |
+| Automatically check for updates | On | Check GitHub for a newer release on launch + daily |
 | AI Text Polish | Off | Clean up wording with a local Ollama model before pasting |
 | Accent colour | `#3b82f6` | Colour of the pill's wave bars and glow |
 | Sound effects | On | Soft chime on start and stop |
@@ -123,11 +137,17 @@ Other scripts:
 electron/
   main.ts              main process — windows, tray, hotkeys, whisper + Ollama
   preload.cts          contextBridge API exposed to the renderer
+  ipc.ts               types shared across the IPC boundary
+  models.ts            the whisper models + download URLs
+  updates.ts           GitHub‑releases update check
   settings-schema.ts   settings shape + defaults (persisted with electron-store)
 src/
   App.tsx              the floating pill: recording, waveform, transcription
   components/
     SettingsModal.tsx  the Settings window
+    Onboarding.tsx     the first‑run permission flow
+    History.tsx        the dictation‑history window
+    About.tsx          the About / check‑for‑updates window
   utils/
     shortcutValidator.ts  hotkey validation + per‑OS blocklists
 scripts/
