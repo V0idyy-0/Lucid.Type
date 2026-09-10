@@ -60,13 +60,10 @@ Grab the latest build from the
 
 ### Prerequisites
 
-- **whisper.cpp CLI** on your `PATH` (or set `WHISPER_CLI` to its full path).
-  Lucid Type looks for `whisper-cli` / `whisper-cpp`, including the common
-  Homebrew locations.
-  - macOS: `brew install whisper-cpp`
-  - Windows / Linux: build from
-    [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and put `whisper-cli`
-    on your `PATH`.
+- **Nothing for basic dictation.** The whisper.cpp engine (`whisper-cli`) and the
+  `ggml-base.en` model are bundled in the release builds. If you run from source,
+  `npm install` fetches the model and `npm run dist` builds `whisper-cli`; you can
+  also set `WHISPER_CLI` to point at your own build.
 - **Ollama** — only if you turn on *AI Text Polish*. Run
   `ollama pull llama3.2:1b` and keep `ollama serve` running on
   `localhost:11434`.
@@ -117,6 +114,7 @@ Other scripts:
 | `npm run electron:start` | Production build, then run in Electron |
 | `npm run dist` | Package installers into `dist-release/` via electron‑builder |
 | `npm run fetch:model` | Download `ggml-base.en.bin` if missing |
+| `npm run fetch:whisper` | Build `whisper-cli` for this platform into `bin/` (needs CMake) |
 | `npm run lint` | oxlint |
 
 ### Project layout
@@ -133,7 +131,8 @@ src/
   utils/
     shortcutValidator.ts  hotkey validation + per‑OS blocklists
 scripts/
-  fetch-model.mjs      idempotent whisper model download (postinstall / predist)
+  fetch-model.mjs        idempotent whisper model download (postinstall / predist)
+  fetch-whisper-cli.sh   builds whisper.cpp's whisper-cli per platform (predist / CI)
 ```
 
 ### Packaging

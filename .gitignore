@@ -20,6 +20,10 @@ dist-ssr
 # Whisper model — ~142 MB, fetched by scripts/fetch-model.mjs (npm postinstall)
 bin/models/*.bin
 
+# whisper.cpp CLI — built per-platform by scripts/fetch-whisper-cli.sh
+bin/whisper-cli
+bin/whisper-cli.exe
+
 # Packaged installers — never commit; CI publishes them to GitHub Releases
 *.dmg
 *.exe

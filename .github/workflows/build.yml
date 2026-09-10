@@ -44,11 +44,23 @@ jobs:
           path: bin/models
           key: whisper-model-ggml-base.en
 
+      - name: Cache whisper.cpp CLI
+        uses: actions/cache@v4
+        with:
+          path: |
+            bin/whisper-cli
+            bin/whisper-cli.exe
+          key: whisper-cli-${{ matrix.target }}-v1.9.3
+
       - name: Install dependencies
         run: npm ci
 
       - name: Fetch whisper model
         run: npm run fetch:model
+
+      - name: Build whisper.cpp CLI
+        shell: bash
+        run: npm run fetch:whisper
 
       - name: Lint
         if: matrix.target == 'macos'
