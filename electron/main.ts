@@ -1,9 +1,12 @@
 import { exec, execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createWriteStream, existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { availableParallelism, tmpdir } from 'node:os'
 import path from 'node:path'
+import { Readable, Transform } from 'node:stream'
+import type { ReadableStream as WebReadableStream } from 'node:stream/web'
+import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import {
@@ -14,15 +17,35 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
   session,
   shell,
+  systemPreferences,
   Tray,
 } from 'electron'
 import activeWin from 'active-win'
 import Store from 'electron-store'
 import { uIOhook, UiohookKey, type UiohookKeyboardEvent } from 'uiohook-napi'
-import { DEFAULT_SETTINGS, sanitizeSettings, type Settings } from './settings-schema.js'
-import type { PolishOutcome, TranscribeResult } from './ipc.js'
+import {
+  DEFAULT_SETTINGS,
+  migrateLegacyHotkeySettings,
+  sanitizeSettings,
+  type ModelId,
+  type Replacement,
+  type Settings,
+} from './settings-schema.js'
+import { MODELS, MODEL_LIST } from './models.js'
+import { checkForUpdate } from './updates.js'
+import type {
+  HistoryEntry,
+  MicrophoneAccessStatus,
+  ModelDownloadProgress,
+  ModelStatus,
+  PermissionStatus,
+  PolishOutcome,
+  TranscribeResult,
+  UpdateCheckResult,
+} from './ipc.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -43,6 +66,33 @@ function cleanTranscript(raw: string, stripFillerWords: boolean): string {
     .replace(/\s{2,}/g, ' ') // collapse runs of whitespace
     .replace(/^[\s,;:.!?]+/, '') // no leading punctuation/space
     .trim()
+}
+
+/** Escape a string for use as a literal inside a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Apply the user's literal find/replace rules to a finished transcript. Matches
+ * are case-insensitive and — for single-word `from` terms — bounded to whole
+ * words so "cat" doesn't rewrite "category". When the matched text was
+ * capitalised (e.g. sentence-initial) the replacement's first letter is
+ * capitalised to match.
+ */
+function applyReplacements(text: string, rules: Replacement[]): string {
+  let out = text
+  for (const { from, to } of rules) {
+    if (!from) continue
+    const boundary = /^\w[\w'-]*$/.test(from) ? '\\b' : ''
+    const re = new RegExp(`${boundary}${escapeRegExp(from)}${boundary}`, 'gi')
+    out = out.replace(re, (match) => {
+      if (!to) return ''
+      const wasCapitalised = /^[A-Z]/.test(match) && /^[a-z]/.test(to)
+      return wasCapitalised ? to[0].toUpperCase() + to.slice(1) : to
+    })
+  }
+  return out
 }
 
 /**
@@ -115,11 +165,16 @@ function scrubText(text: string): string {
   return out
 }
 
-/** Local Ollama endpoint used for the optional "AI Text Polish" pass. */
-const OLLAMA_URL = 'http://localhost:11434/api/generate'
+/** Local Ollama endpoint used for the optional "AI Text Polish" pass. Uses the
+ *  IPv4 loopback literal, not `localhost` — Node's fetch can resolve
+ *  `localhost` to the IPv6 loopback first, which fails instantly against
+ *  Ollama's IPv4-only default bind and looks identical to "not running". */
+const OLLAMA_URL = 'http://127.0.0.1:11434/api/generate'
 const OLLAMA_MODEL = 'llama3.2:1b'
-/** How long to wait on Ollama before giving up and using the regex cleaner. */
-const OLLAMA_TIMEOUT_MS = 1500
+/** How long to wait on Ollama before giving up and using the regex cleaner.
+ *  Generous enough to tolerate a cold model load (first request after Ollama
+ *  starts/loads the model into memory can take a few seconds). */
+const OLLAMA_TIMEOUT_MS = 4000
 
 /**
  * The editing contract handed to Ollama on every polish pass. Kept terse — a 1B
@@ -168,8 +223,10 @@ function formattingGuidance(appName?: string): string {
  * transcript: resolve mid-sentence self-corrections, strip filler words, and add
  * natural punctuation. `activeAppName` — the app the transcript is about to land
  * in — tunes the output formatting. Entirely best-effort: if Ollama isn't
- * running, is slow, or returns something unusable we abort after 1.5s and return
- * null so the caller falls back to {@link cleanTranscript}.
+ * running, is slow, or returns something unusable we abort after
+ * {@link OLLAMA_TIMEOUT_MS} and return null so the caller falls back to
+ * {@link cleanTranscript}. Every failure is logged (not just swallowed) so a
+ * user-reported "Ollama unavailable" toast is diagnosable from the console.
  */
 async function polishTranscript(raw: string, activeAppName?: string): Promise<string | null> {
   const controller = new AbortController()
@@ -186,14 +243,24 @@ async function polishTranscript(raw: string, activeAppName?: string): Promise<st
       }),
       signal: controller.signal,
     })
-    if (!res.ok) return null
+    if (!res.ok) {
+      // Distinguish "reachable but rejected the request" (e.g. a 404 because
+      // OLLAMA_MODEL isn't pulled under that exact tag) from "unreachable" —
+      // both fall back the same way, but only one of them is diagnosable here.
+      console.warn(`Ollama polish failed: HTTP ${res.status} from ${OLLAMA_URL} (model "${OLLAMA_MODEL}")`)
+      return null
+    }
     const data = (await res.json()) as { response?: unknown }
     // Don't trust the local model's output shape: scrub control/format
     // characters and clamp the length before it re-enters the pipeline.
     const polished = typeof data.response === 'string' ? scrubText(data.response).trim() : ''
     return polished || null
-  } catch {
-    // Ollama not running, aborted by the timeout, or a malformed response.
+  } catch (err) {
+    const reason =
+      (err as Error)?.name === 'AbortError'
+        ? `timed out after ${OLLAMA_TIMEOUT_MS}ms`
+        : ((err as Error)?.message ?? String(err))
+    console.warn(`Ollama polish failed: ${reason}`)
     return null
   } finally {
     clearTimeout(timer)
@@ -343,7 +410,23 @@ function resolveBundled(name: string, ...segments: string[]): string {
   return candidates.find((c) => existsSync(c)) ?? name
 }
 
-const MODEL_PATH = resolveBundled('ggml-base.en.bin', 'bin', 'models')
+/** Where on-demand model downloads are written — a writable dir that survives
+ *  app updates, unlike the packaged resources folder. */
+const USER_MODELS_DIR = path.join(app.getPath('userData'), 'models')
+
+/** Absolute path to a model's file: a user-downloaded copy wins over a bundled
+ *  one; falls back to the bare bundled name when neither exists. */
+function modelFilePath(id: ModelId): string {
+  const userCopy = path.join(USER_MODELS_DIR, MODELS[id].file)
+  if (existsSync(userCopy)) return userCopy
+  return resolveBundled(MODELS[id].file, 'bin', 'models')
+}
+
+/** Whether a model's file is present locally (bundled or downloaded). */
+function isModelDownloaded(id: ModelId): boolean {
+  if (existsSync(path.join(USER_MODELS_DIR, MODELS[id].file))) return true
+  return BIN_ROOTS.some((root) => existsSync(path.join(root, 'bin', 'models', MODELS[id].file)))
+}
 
 /** Resolve the whisper.cpp CLI. Honour an explicit override, then a binary
  *  bundled under `bin/`, then the usual per-OS install locations, then a bare
@@ -376,8 +459,30 @@ const OVERLAY_HEIGHT = 70
 
 let win: BrowserWindow | null = null
 let settingsWin: BrowserWindow | null = null
+let onboardingWin: BrowserWindow | null = null
+let historyWin: BrowserWindow | null = null
+let aboutWin: BrowserWindow | null = null
 let tray: Tray | null = null
 let store: Store<Settings>
+/** First-run onboarding completion flag, kept in its own tiny store so it
+ *  never gets tangled up with the user-facing {@link Settings}. */
+let onboardingStore: Store<{ completed: boolean }>
+/** Local dictation-history log, gated behind the `saveHistory` setting. */
+let historyStore: Store<{ entries: HistoryEntry[] }>
+
+/** Last-seen "auto-paste was blocked by missing Accessibility" state, so the
+ *  tray only rebuilds its fix-it item when the situation actually changes. */
+let lastAutoPasteBlocked = false
+
+/** True while a temporary global Esc shortcut is registered for cancelling the
+ *  in-progress take. */
+let cancelShortcutOn = false
+
+/** Last update check result, surfaced to the About window and the tray. */
+let lastUpdateResult: UpdateCheckResult | null = null
+/** The version we've already shown a "new release" notification for this
+ *  session, so a background re-check doesn't nag again. */
+let notifiedVersion: string | null = null
 
 /** The accelerator we actually managed to register (may differ from the
  *  requested one if it was invalid or already claimed by another app). */
@@ -385,12 +490,18 @@ let activeHotkey: string | null = null
 
 /** Push-to-talk state: the parsed hotkey we're watching for via the raw
  *  keyboard hook, the modifier keycodes that also end a take, whether the key
- *  is currently held (also used to swallow OS auto-repeat), and whether the
- *  uiohook listener thread is running. */
+ *  is currently held (also used to swallow OS auto-repeat), whether the
+ *  uiohook listener thread is running, and the accelerator (if any) we
+ *  additionally claimed via `globalShortcut` purely so the OS stops
+ *  delivering it to the focused app — see {@link enablePushToTalk}. */
 let pttMatcher: HotkeyMatcher | null = null
 let pttModifierKeycodes = new Set<number>()
 let pttKeyHeld = false
 let uiohookRunning = false
+let pttSuppressedAccelerator: string | null = null
+/** Modifier-only PTT combos only (see {@link HotkeyMatcher}): physical
+ *  modifier keycodes currently held that belong to the combo. */
+let pttHeldModifierKeycodes = new Set<number>()
 
 /** Live settings, or the defaults if the store hasn't been created yet. */
 function settings(): Settings {
@@ -470,14 +581,35 @@ function toggleOverlay() {
 
 // ── Push-to-talk: matching a stored accelerator against raw keyboard events ───
 
-/** A parsed accelerator: the physical key plus the modifier state it requires. */
+/** A parsed accelerator: the physical key plus the modifier state it requires.
+ *  `keycode` is `null` for a modifier-only combo (e.g. "hold Control+Alt,
+ *  no third key") — Electron's `globalShortcut` can't represent that shape,
+ *  but the raw `uiohook` tap can watch for the modifiers alone. */
 interface HotkeyMatcher {
-  keycode: number
+  keycode: number | null
   ctrl: boolean
   alt: boolean
   shift: boolean
   meta: boolean
 }
+
+/** Accelerator tokens that name a modifier rather than a regular key —
+ *  shared between `parseAccelerator`'s "is this combo modifier-only?" check
+ *  and its per-token modifier assignment below. */
+const MODIFIER_TOKENS = new Set([
+  'commandorcontrol',
+  'cmdorctrl',
+  'command',
+  'cmd',
+  'super',
+  'meta',
+  'control',
+  'ctrl',
+  'alt',
+  'option',
+  'altgr',
+  'shift',
+])
 
 const UIOHOOK_KEYS = UiohookKey as Record<string, number>
 
@@ -522,10 +654,37 @@ function tokenKeycode(token: string): number | null {
   return null
 }
 
+/** Fold one modifier token into a matcher's flags (shared by both branches of
+ *  {@link parseAccelerator}). "CommandOrControl" resolves to ⌘ on macOS and
+ *  Ctrl elsewhere; literal "Control"/"Command" always mean that physical key
+ *  regardless of platform. */
+function applyModifierToken(matcher: HotkeyMatcher, mod: string, mac: boolean): void {
+  if (mod === 'commandorcontrol' || mod === 'cmdorctrl') {
+    if (mac) matcher.meta = true
+    else matcher.ctrl = true
+  } else if (mod === 'command' || mod === 'cmd' || mod === 'super' || mod === 'meta') {
+    matcher.meta = true
+  } else if (mod === 'control' || mod === 'ctrl') {
+    matcher.ctrl = true
+  } else if (mod === 'alt' || mod === 'option' || mod === 'altgr') {
+    matcher.alt = true
+  } else if (mod === 'shift') {
+    matcher.shift = true
+  }
+}
+
 /**
- * Parse an Electron accelerator ("Alt+Space", "CommandOrControl+Shift+D") into a
- * {@link HotkeyMatcher}, resolving "CommandOrControl" to ⌘ on macOS and Ctrl
- * elsewhere. Returns null when the final key token isn't one we can match.
+ * Parse an Electron accelerator into a {@link HotkeyMatcher}. Two shapes:
+ *
+ * - Modifier(s) + a regular key ("Alt+Space", "CommandOrControl+Shift+D") —
+ *   the usual case, matched by the exact key going down/up.
+ * - Modifiers only, no regular key ("Control+Alt") — every token names a
+ *   modifier, so there's no trailing key for {@link tokenKeycode} to resolve.
+ *   `keycode` comes back `null`; the caller watches for all the modifiers
+ *   being held at once instead of a specific keycode.
+ *
+ * Returns null when the accelerator is empty, or (in the regular-key shape)
+ * the final token isn't one we can match.
  */
 function parseAccelerator(accelerator: string): HotkeyMatcher | null {
   const parts = accelerator
@@ -534,25 +693,20 @@ function parseAccelerator(accelerator: string): HotkeyMatcher | null {
     .filter(Boolean)
   if (parts.length === 0) return null
 
+  const mac = process.platform === 'darwin'
+  const matcher: HotkeyMatcher = { keycode: null, ctrl: false, alt: false, shift: false, meta: false }
+
+  if (parts.every((p) => MODIFIER_TOKENS.has(p.toLowerCase()))) {
+    for (const mod of parts.map((m) => m.toLowerCase())) applyModifierToken(matcher, mod, mac)
+    return matcher
+  }
+
   const keycode = tokenKeycode(parts[parts.length - 1])
   if (keycode == null) return null
-
-  const mac = process.platform === 'darwin'
-  const matcher: HotkeyMatcher = { keycode, ctrl: false, alt: false, shift: false, meta: false }
+  matcher.keycode = keycode
 
   for (const mod of parts.slice(0, -1).map((m) => m.toLowerCase())) {
-    if (mod === 'commandorcontrol' || mod === 'cmdorctrl') {
-      if (mac) matcher.meta = true
-      else matcher.ctrl = true
-    } else if (mod === 'command' || mod === 'cmd' || mod === 'super' || mod === 'meta') {
-      matcher.meta = true
-    } else if (mod === 'control' || mod === 'ctrl') {
-      matcher.ctrl = true
-    } else if (mod === 'alt' || mod === 'option' || mod === 'altgr') {
-      matcher.alt = true
-    } else if (mod === 'shift') {
-      matcher.shift = true
-    }
+    applyModifierToken(matcher, mod, mac)
   }
   return matcher
 }
@@ -569,15 +723,36 @@ function modifierKeycodes(m: HotkeyMatcher): Set<number> {
   return codes
 }
 
-/** True when a raw keyboard event is exactly the hotkey combo. */
+/** True when a raw keyboard event is exactly the hotkey combo (regular-key
+ *  matchers only — always false for a modifier-only matcher, which is
+ *  engaged via {@link modifiersSatisfied} instead). */
 function eventMatchesHotkey(m: HotkeyMatcher, e: UiohookKeyboardEvent): boolean {
   return (
+    m.keycode != null &&
     e.keycode === m.keycode &&
     e.ctrlKey === m.ctrl &&
     e.altKey === m.alt &&
     e.shiftKey === m.shift &&
     e.metaKey === m.meta
   )
+}
+
+/** One `[left, right]` uiohook keycode pair per modifier a matcher requires —
+ *  used for a modifier-only combo, where "held" means at least one keycode
+ *  from *every* required pair is currently down. */
+function modifierGroups(m: HotkeyMatcher): number[][] {
+  const groups: number[][] = []
+  if (m.ctrl) groups.push([UiohookKey.Ctrl, UiohookKey.CtrlRight])
+  if (m.alt) groups.push([UiohookKey.Alt, UiohookKey.AltRight])
+  if (m.shift) groups.push([UiohookKey.Shift, UiohookKey.ShiftRight])
+  if (m.meta) groups.push([UiohookKey.Meta, UiohookKey.MetaRight])
+  return groups
+}
+
+/** True once every modifier a modifier-only combo requires has at least one
+ *  physical key (left or right) currently held. */
+function modifiersSatisfied(m: HotkeyMatcher, held: ReadonlySet<number>): boolean {
+  return modifierGroups(m).every((group) => group.some((code) => held.has(code)))
 }
 
 /** Hotkey pressed: reveal the pill and tell the renderer to start capturing.
@@ -610,7 +785,42 @@ function onPushToTalkKeyup(e: UiohookKeyboardEvent): void {
   endPushToTalk()
 }
 
-/** Start (or reconfigure) the raw keyboard hook for push-to-talk. */
+/** Modifier-only PTT combo (e.g. "hold Control+Alt"): track which required
+ *  modifier keys are currently down and begin the take once all of them are. */
+function onPushToTalkModifierKeydown(e: UiohookKeyboardEvent): void {
+  if (!pttMatcher || pttMatcher.keycode !== null) return
+  if (!pttModifierKeycodes.has(e.keycode)) return
+  pttHeldModifierKeycodes.add(e.keycode)
+  if (!pttKeyHeld && modifiersSatisfied(pttMatcher, pttHeldModifierKeycodes)) {
+    pttKeyHeld = true
+    beginPushToTalk()
+  }
+}
+
+/** End the take as soon as any required modifier is released — releasing one
+ *  is enough, the user doesn't have to lift every key at once. */
+function onPushToTalkModifierKeyup(e: UiohookKeyboardEvent): void {
+  if (!pttMatcher || pttMatcher.keycode !== null) return
+  if (!pttModifierKeycodes.has(e.keycode)) return
+  pttHeldModifierKeycodes.delete(e.keycode)
+  if (pttKeyHeld && !modifiersSatisfied(pttMatcher, pttHeldModifierKeycodes)) {
+    pttKeyHeld = false
+    endPushToTalk()
+  }
+}
+
+/**
+ * Start (or reconfigure) push-to-talk for `accelerator`. Hold/release timing
+ * comes entirely from the raw `uiohook` keydown/keyup taps (unchanged below).
+ * `uiohook` is listen-only, though — it can watch the key but can't stop the
+ * OS from also delivering it to whatever app is focused, so on its own the
+ * combo leaks into text fields (worse for something like `Alt+Space`, which
+ * macOS already treats as a non-breaking-space input). To stop that, also
+ * claim the exact accelerator with `globalShortcut` (a no-op callback — it
+ * exists purely so the OS treats the combo as claimed and never hands it to
+ * the focused app), the same mechanism the toggle hotkey and the in-recording
+ * `Escape` cancel shortcut already use safely alongside this hook.
+ */
 function enablePushToTalk(accelerator: string): void {
   const matcher = parseAccelerator(accelerator)
   if (!matcher) {
@@ -619,14 +829,24 @@ function enablePushToTalk(accelerator: string): void {
     return
   }
 
+  const modifierOnly = matcher.keycode === null
+
   pttMatcher = matcher
   pttModifierKeycodes = modifierKeycodes(matcher)
+  pttHeldModifierKeycodes = new Set()
   pttKeyHeld = false
 
   uIOhook.removeListener('keydown', onPushToTalkKeydown)
   uIOhook.removeListener('keyup', onPushToTalkKeyup)
-  uIOhook.on('keydown', onPushToTalkKeydown)
-  uIOhook.on('keyup', onPushToTalkKeyup)
+  uIOhook.removeListener('keydown', onPushToTalkModifierKeydown)
+  uIOhook.removeListener('keyup', onPushToTalkModifierKeyup)
+  if (modifierOnly) {
+    uIOhook.on('keydown', onPushToTalkModifierKeydown)
+    uIOhook.on('keyup', onPushToTalkModifierKeyup)
+  } else {
+    uIOhook.on('keydown', onPushToTalkKeydown)
+    uIOhook.on('keyup', onPushToTalkKeyup)
+  }
 
   if (!uiohookRunning) {
     try {
@@ -638,16 +858,47 @@ function enablePushToTalk(accelerator: string): void {
       console.warn(`Push-to-talk: couldn't start the keyboard hook: ${(err as Error).message}`)
     }
   }
+
+  if (modifierOnly) {
+    // Electron's accelerator grammar has no way to express "these modifiers
+    // held, no key" — there's nothing to register, so this combo can never
+    // be claimed from the OS the way a regular key+modifier one can. It'll
+    // keep working via uiohook above, it just may leak into the focused app
+    // (surfaced as a persistent note in Settings, not just this log).
+    pttSuppressedAccelerator = null
+    console.warn(`Push-to-talk: "${accelerator}" is modifier-only and can't be claimed from the OS.`)
+  } else {
+    try {
+      if (globalShortcut.register(accelerator, () => {})) {
+        pttSuppressedAccelerator = accelerator
+      } else {
+        // Already claimed by the OS or another app — push-to-talk still works
+        // via uiohook above, it just won't be swallowed from the focused app.
+        pttSuppressedAccelerator = null
+        console.warn(
+          `Push-to-talk: "${accelerator}" couldn't be claimed from the OS; it may leak into the focused app.`,
+        )
+      }
+    } catch (err) {
+      pttSuppressedAccelerator = null
+      console.warn(`Push-to-talk: invalid accelerator "${accelerator}": ${(err as Error).message}`)
+    }
+  }
+
   activeHotkey = accelerator
 }
 
-/** Tear down the push-to-talk keyboard hook. */
+/** Tear down push-to-talk: the keyboard hook, and the OS-level claim on
+ *  whatever accelerator {@link enablePushToTalk} last suppressed (if any). */
 function disablePushToTalk(): void {
   pttMatcher = null
   pttKeyHeld = false
   pttModifierKeycodes = new Set()
+  pttHeldModifierKeycodes = new Set()
   uIOhook.removeListener('keydown', onPushToTalkKeydown)
   uIOhook.removeListener('keyup', onPushToTalkKeyup)
+  uIOhook.removeListener('keydown', onPushToTalkModifierKeydown)
+  uIOhook.removeListener('keyup', onPushToTalkModifierKeyup)
   if (uiohookRunning) {
     try {
       uIOhook.stop()
@@ -656,51 +907,64 @@ function disablePushToTalk(): void {
     }
     uiohookRunning = false
   }
+  if (pttSuppressedAccelerator) {
+    try {
+      globalShortcut.unregister(pttSuppressedAccelerator)
+    } catch {
+      // Already unregistered.
+    }
+    pttSuppressedAccelerator = null
+  }
 }
 
 /**
- * (Re-)bind the global dictation hotkey to whichever trigger mode is active.
+ * (Re-)bind both dictation hotkeys from settings. Toggle and push-to-talk are
+ * independent — either, both, or (if push-to-talk is unset) just toggle can
+ * be live at once:
  *
- * - `toggle` — `globalShortcut` registers the accelerator (which the focused app
- *   never sees); a tap flips the renderer's recording state. Falls back to the
- *   default accelerator if the requested one is malformed or already claimed.
- * - `ptt` — a raw `uiohook` keyboard hook watches for the combo's keydown/keyup
- *   so the key can be *held*. Unlike `globalShortcut`, the combo is NOT swallowed
- *   from the focused app, so an unobtrusive hotkey works best here.
+ * - Toggle — `globalShortcut` registers the accelerator (which the focused
+ *   app never sees); a tap flips the renderer's recording state. Falls back
+ *   to the default accelerator if the requested one is malformed or already
+ *   claimed. Always bound (empty settings fall back to the default).
+ * - Push-to-talk — a raw `uiohook` keyboard hook watches for the combo's
+ *   keydown/keyup so the key can be *held*, plus a `globalShortcut`
+ *   registration purely to keep the OS from also delivering it to the
+ *   focused app (see {@link enablePushToTalk}). Only bound when
+ *   `pttHotkey` is non-empty — there's no default to fall back to.
  *
- * Whatever was bound before is torn down first so a mode or hotkey edit never
- * leaves a stale binding live.
+ * Whatever was bound before is torn down first so a hotkey edit never leaves
+ * a stale binding live.
  */
 function registerHotkey(): void {
   globalShortcut.unregisterAll()
   activeHotkey = null
-
-  const wanted = settings().hotkey.trim() || DEFAULT_SETTINGS.hotkey
-
-  if (settings().dictationMode === 'ptt') {
-    enablePushToTalk(wanted)
-    return
-  }
-
   disablePushToTalk()
 
+  const { toggleHotkey, pttHotkey } = settings()
+  const wantedToggle = toggleHotkey.trim() || DEFAULT_SETTINGS.toggleHotkey
+
   const candidates =
-    wanted === DEFAULT_SETTINGS.hotkey ? [wanted] : [wanted, DEFAULT_SETTINGS.hotkey]
+    wantedToggle === DEFAULT_SETTINGS.toggleHotkey
+      ? [wantedToggle]
+      : [wantedToggle, DEFAULT_SETTINGS.toggleHotkey]
 
   for (const accelerator of candidates) {
     try {
       if (globalShortcut.register(accelerator, toggleOverlay)) {
         activeHotkey = accelerator
-        if (accelerator !== wanted) {
-          console.warn(`Hotkey "${wanted}" was unavailable; fell back to "${accelerator}".`)
+        if (accelerator !== wantedToggle) {
+          console.warn(`Toggle hotkey "${wantedToggle}" was unavailable; fell back to "${accelerator}".`)
         }
-        return
+        break
       }
     } catch (err) {
-      console.warn(`Invalid accelerator "${accelerator}": ${(err as Error).message}`)
+      console.warn(`Invalid toggle accelerator "${accelerator}": ${(err as Error).message}`)
     }
   }
-  console.warn(`Could not register a global hotkey (wanted "${wanted}").`)
+  if (!activeHotkey) console.warn(`Could not register a toggle hotkey (wanted "${wantedToggle}").`)
+
+  const wantedPtt = pttHotkey.trim()
+  if (wantedPtt) enablePushToTalk(wantedPtt)
 }
 
 /** Parse "#rrggbb" into an [r, g, b] triple; defaults to the stock blue. */
@@ -779,27 +1043,54 @@ function refreshTray(): void {
   const s = settings()
   const hotkeyHint = activeHotkey ? `  ${prettyAccelerator(activeHotkey)}` : ''
 
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: `Start / stop dictation${hotkeyHint}`, click: () => toggleOverlay() },
+  const template: Electron.MenuItemConstructorOptions[] = [
+    { label: `Start / stop dictation${hotkeyHint}`, click: () => toggleOverlay() },
+    { type: 'separator' },
+    {
+      label: 'Auto-paste transcript',
+      type: 'checkbox',
+      checked: s.autoPaste,
+      click: (item) => void applySettings({ autoPaste: item.checked }),
+    },
+    {
+      label: 'Strip filler words',
+      type: 'checkbox',
+      checked: s.stripFillerWords,
+      click: (item) => void applySettings({ stripFillerWords: item.checked }),
+    },
+    {
+      label: 'Launch at login',
+      type: 'checkbox',
+      checked: s.launchAtLogin,
+      click: (item) => void applySettings({ launchAtLogin: item.checked }),
+    },
+  ]
+
+  if (lastAutoPasteBlocked) {
+    template.push(
       { type: 'separator' },
-      {
-        label: 'Auto-paste transcript',
-        type: 'checkbox',
-        checked: s.autoPaste,
-        click: (item) => void applySettings({ autoPaste: item.checked }),
-      },
-      {
-        label: 'Strip filler words',
-        type: 'checkbox',
-        checked: s.stripFillerWords,
-        click: (item) => void applySettings({ stripFillerWords: item.checked }),
-      },
+      { label: 'Enable auto-paste…', click: () => openPermissionSettings('accessibility') },
+    )
+  }
+
+  if (lastUpdateResult?.updateAvailable && lastUpdateResult.url) {
+    const url = lastUpdateResult.url
+    template.push(
       { type: 'separator' },
-      { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: () => openSettings() },
-      { label: 'Quit Lucid Type', role: 'quit' },
-    ]),
+      { label: `Download Lucid Type ${lastUpdateResult.latest}…`, click: () => void shell.openExternal(url) },
+    )
+  }
+
+  template.push(
+    { type: 'separator' },
+    { label: 'Dictation History…', click: () => openHistory() },
+    { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: () => openSettings() },
+    { label: 'Check for Updates…', click: () => void runUpdateCheck().then(() => openAbout()) },
+    { label: 'About Lucid Type', click: () => openAbout() },
+    { label: 'Quit Lucid Type', role: 'quit' },
   )
+
+  tray.setContextMenu(Menu.buildFromTemplate(template))
 }
 
 /**
@@ -807,11 +1098,17 @@ function refreshTray(): void {
  * if it changed, repaint the tray, and push the fresh values to every renderer.
  */
 function applySettings(patch: Partial<Settings>): Settings {
-  const clean = sanitizeSettings(patch)
+  const clean = sanitizeSettings(patch, store.store)
   if (Object.keys(clean).length > 0) store.set(clean)
 
   const next = store.store
-  if ('hotkey' in clean || 'dictationMode' in clean) registerHotkey()
+  if ('toggleHotkey' in clean || 'pttHotkey' in clean) registerHotkey()
+  if ('launchAtLogin' in clean) syncLoginItem()
+  if ('historyLimit' in clean && historyStore) {
+    const trimmed = historyStore.get('entries', []).slice(0, Math.max(1, next.historyLimit))
+    historyStore.set('entries', trimmed)
+    historyWin?.webContents.send('history:changed')
+  }
   refreshTray()
   for (const w of BrowserWindow.getAllWindows()) {
     w.webContents.send('settings:changed', next)
@@ -865,14 +1162,407 @@ function openSettings(): void {
   })
 }
 
+/** Open — or focus, if already open — the Dictation History window. */
+function openHistory(): void {
+  if (historyWin && !historyWin.isDestroyed()) {
+    historyWin.show()
+    historyWin.focus()
+    return
+  }
+
+  const mac = process.platform === 'darwin'
+
+  historyWin = new BrowserWindow({
+    width: 560,
+    height: 560,
+    minWidth: 380,
+    minHeight: 320,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: false,
+    title: 'Dictation History',
+    icon: APP_ICON,
+    backgroundColor: mac ? '#00000000' : '#0e0f17',
+    vibrancy: mac ? 'sidebar' : undefined,
+    titleBarStyle: mac ? 'hiddenInset' : 'default',
+    trafficLightPosition: mac ? { x: 12, y: 12 } : undefined,
+    autoHideMenuBar: process.platform === 'win32',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+
+  if (DEV_SERVER_URL) {
+    void historyWin.loadURL(`${DEV_SERVER_URL}#history`)
+  } else {
+    void historyWin.loadFile(path.join(APP_ROOT, 'dist', 'index.html'), { hash: 'history' })
+  }
+
+  historyWin.once('ready-to-show', () => historyWin?.show())
+  historyWin.on('closed', () => {
+    historyWin = null
+  })
+}
+
+/** Open — or focus, if already open — the About window. */
+function openAbout(): void {
+  if (aboutWin && !aboutWin.isDestroyed()) {
+    aboutWin.show()
+    aboutWin.focus()
+    return
+  }
+
+  const mac = process.platform === 'darwin'
+
+  aboutWin = new BrowserWindow({
+    width: 400,
+    height: 470,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: false,
+    center: true,
+    title: 'About Lucid Type',
+    icon: APP_ICON,
+    backgroundColor: mac ? '#00000000' : '#0e0f17',
+    vibrancy: mac ? 'sidebar' : undefined,
+    titleBarStyle: mac ? 'hiddenInset' : 'default',
+    trafficLightPosition: mac ? { x: 12, y: 12 } : undefined,
+    autoHideMenuBar: process.platform === 'win32',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+
+  if (DEV_SERVER_URL) {
+    void aboutWin.loadURL(`${DEV_SERVER_URL}#about`)
+  } else {
+    void aboutWin.loadFile(path.join(APP_ROOT, 'dist', 'index.html'), { hash: 'about' })
+  }
+
+  aboutWin.once('ready-to-show', () => aboutWin?.show())
+  aboutWin.on('closed', () => {
+    aboutWin = null
+  })
+}
+
+// ── Launch at login ─────────────────────────────────────────────────────────
+
+/** Bring the OS "open at login" state in line with the stored setting. Called
+ *  on startup (so a fresh install's default actually registers) and whenever
+ *  the setting changes. The app has no dock icon and shows no window on launch,
+ *  so it already starts quietly in the menu bar. */
+function syncLoginItem(): void {
+  try {
+    app.setLoginItemSettings({ openAtLogin: settings().launchAtLogin })
+  } catch (err) {
+    console.warn(`Could not update the login item: ${(err as Error).message}`)
+  }
+}
+
+// ── Update check ────────────────────────────────────────────────────────────
+
+/**
+ * Run a GitHub-releases update check, cache the result, and fan it out to the
+ * About window + tray. On a newly-seen newer release, also raise a desktop
+ * notification (once per version per session).
+ */
+async function runUpdateCheck(): Promise<UpdateCheckResult> {
+  const result = await checkForUpdate(app.getVersion())
+  lastUpdateResult = result
+
+  for (const w of BrowserWindow.getAllWindows()) {
+    w.webContents.send('updates:status', result)
+  }
+  refreshTray()
+
+  if (
+    result.updateAvailable &&
+    result.latest &&
+    result.latest !== notifiedVersion &&
+    Notification.isSupported()
+  ) {
+    notifiedVersion = result.latest
+    const note = new Notification({
+      title: `Lucid Type ${result.latest} is available`,
+      body: 'Click to open the download page.',
+    })
+    note.on('click', () => {
+      if (result.url) void shell.openExternal(result.url)
+    })
+    note.show()
+  }
+
+  return result
+}
+
+// ── First-run onboarding ──────────────────────────────────────────────────
+
+/**
+ * Best-effort microphone permission snapshot. `getMediaAccessStatus` is only
+ * implemented on macOS and Windows; Linux (and any future platform) reports
+ * `unsupported` so the onboarding UI falls back to just trying `getUserMedia`.
+ */
+function getMicrophoneStatus(): MicrophoneAccessStatus {
+  if (process.platform === 'darwin' || process.platform === 'win32') {
+    try {
+      return systemPreferences.getMediaAccessStatus('microphone') as MicrophoneAccessStatus
+    } catch {
+      return 'unsupported'
+    }
+  }
+  return 'unsupported'
+}
+
+/** Current macOS Accessibility trust (needed for auto-paste + push-to-talk).
+ *  Reported as `true` ("not applicable") on platforms without the concept. */
+function getAccessibilityStatus(): boolean {
+  if (process.platform !== 'darwin') return true
+  try {
+    return systemPreferences.isTrustedAccessibilityClient(false)
+  } catch {
+    return true
+  }
+}
+
+/** Snapshot of every permission the onboarding flow cares about. */
+function getPermissionStatus(): PermissionStatus {
+  return {
+    platform: process.platform,
+    microphone: getMicrophoneStatus(),
+    accessibility: getAccessibilityStatus(),
+  }
+}
+
+/**
+ * Ask macOS for microphone access, surfacing the native TCC prompt the first
+ * time it's called. Windows/Linux have no equivalent main-process API — the
+ * renderer's own `getUserMedia` call is what triggers the OS-level prompt
+ * there, so this just reports the current status back.
+ */
+async function requestMicrophoneAccess(): Promise<MicrophoneAccessStatus> {
+  if (process.platform === 'darwin') {
+    try {
+      const granted = await systemPreferences.askForMediaAccess('microphone')
+      return granted ? 'granted' : 'denied'
+    } catch {
+      return getMicrophoneStatus()
+    }
+  }
+  return getMicrophoneStatus()
+}
+
+/**
+ * Ask macOS for Accessibility trust. `isTrustedAccessibilityClient(true)`
+ * shows the native "would like to control this computer" prompt the first
+ * time (and lists the app in Privacy & Security → Accessibility); actually
+ * flipping the toggle is always a manual step for the user, so this just
+ * reports whether it happens to be trusted already. Not applicable elsewhere.
+ */
+function requestAccessibilityAccess(): boolean {
+  if (process.platform !== 'darwin') return true
+  try {
+    return systemPreferences.isTrustedAccessibilityClient(true)
+  } catch {
+    return getAccessibilityStatus()
+  }
+}
+
+/** Deep-link straight to the System Settings pane for a permission, so a user
+ *  who dismissed the native prompt (or is toggling it back on) doesn't have to
+ *  go hunting for it. No-op on platforms without that concept. */
+function openPermissionSettings(kind: 'microphone' | 'accessibility'): void {
+  if (process.platform === 'darwin') {
+    const pane = kind === 'microphone' ? 'Privacy_Microphone' : 'Privacy_Accessibility'
+    void shell.openExternal(`x-apple.systempreferences:com.apple.preference.security?${pane}`)
+  } else if (process.platform === 'win32' && kind === 'microphone') {
+    void shell.openExternal('ms-settings:privacy-microphone')
+  }
+}
+
+/** Open — or focus, if already open — the first-run onboarding window. Shown
+ *  once (until {@link onboardingStore}'s `completed` flag is set) so a new
+ *  install walks through granting the permissions the app needs before the
+ *  user goes looking for the (dock-icon-less) app and finds nothing there. */
+function openOnboarding(): void {
+  if (onboardingWin && !onboardingWin.isDestroyed()) {
+    onboardingWin.show()
+    onboardingWin.focus()
+    return
+  }
+
+  onboardingWin = new BrowserWindow({
+    width: 460,
+    height: 620,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: false,
+    center: true,
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    title: 'Welcome to Lucid Type',
+    icon: APP_ICON,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+
+  if (DEV_SERVER_URL) {
+    void onboardingWin.loadURL(`${DEV_SERVER_URL}#onboarding`)
+  } else {
+    void onboardingWin.loadFile(path.join(APP_ROOT, 'dist', 'index.html'), { hash: 'onboarding' })
+  }
+
+  onboardingWin.once('ready-to-show', () => onboardingWin?.show())
+  onboardingWin.on('closed', () => {
+    onboardingWin = null
+  })
+}
+
+// ── Dictation history ────────────────────────────────────────────────────────
+
+/** Append a finished transcript to the local history, oldest-first trimmed to
+ *  the `historyLimit` setting. No-op unless `saveHistory` is on (checked by the
+ *  caller). */
+function addHistoryEntry(text: string, appName?: string): void {
+  if (!historyStore) return
+  const entry: HistoryEntry = {
+    id: randomUUID(),
+    text,
+    chars: text.length,
+    app: appName,
+    at: Date.now(),
+  }
+  const limit = Math.max(1, settings().historyLimit)
+  const entries = [entry, ...historyStore.get('entries', [])].slice(0, limit)
+  historyStore.set('entries', entries)
+  historyWin?.webContents.send('history:changed')
+}
+
+// ── On-demand model downloads ────────────────────────────────────────────────
+
+/** The current whisper models plus whether each one's file is on disk. */
+function modelStatuses(): ModelStatus[] {
+  return MODEL_LIST.map((spec) => ({
+    id: spec.id,
+    label: spec.label,
+    file: spec.file,
+    sizeMB: spec.sizeMB,
+    downloaded: isModelDownloaded(spec.id),
+  }))
+}
+
+/** Serialises downloads so two requests can't write the same file at once. */
+let modelDownloadChain: Promise<unknown> = Promise.resolve()
+
+function emitModelProgress(progress: ModelDownloadProgress): void {
+  for (const w of BrowserWindow.getAllWindows()) {
+    w.webContents.send('model:download-progress', progress)
+  }
+}
+
+/**
+ * Fetch a whisper model into {@link USER_MODELS_DIR}, streaming to a temp file
+ * and renaming on success. Emits `model:download-progress` as it goes. Resolves
+ * once the file is in place; rejects (and reports via a `done` + `error`
+ * progress event) on any failure.
+ */
+async function downloadModel(id: ModelId): Promise<void> {
+  const run = modelDownloadChain.catch(() => {}).then(async () => {
+    if (isModelDownloaded(id)) return
+
+    const spec = MODELS[id]
+    await mkdir(USER_MODELS_DIR, { recursive: true })
+    const dest = path.join(USER_MODELS_DIR, spec.file)
+    const tmp = `${dest}.download`
+
+    try {
+      const res = await fetch(spec.url, { redirect: 'follow' })
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`)
+      }
+      const total = Number(res.headers.get('content-length')) || 0
+      let received = 0
+
+      // Count bytes with a passthrough in the pipeline — attaching a 'data'
+      // listener directly would fight `pipeline` for the stream.
+      const counter = new Transform({
+        transform(chunk: Buffer, _enc, cb) {
+          received += chunk.length
+          emitModelProgress({ id, received, total })
+          cb(null, chunk)
+        },
+      })
+      const body = Readable.fromWeb(res.body as unknown as WebReadableStream<Uint8Array>)
+      await pipeline(body, counter, createWriteStream(tmp))
+
+      const got = (await stat(tmp)).size
+      if (got < spec.sizeMB * 1024 * 1024 * 0.8) {
+        await unlink(tmp).catch(() => {})
+        throw new Error('download was incomplete')
+      }
+      await rename(tmp, dest)
+      emitModelProgress({ id, received: got, total: got, done: true })
+    } catch (err) {
+      await unlink(tmp).catch(() => {})
+      const message = err instanceof Error ? err.message : String(err)
+      emitModelProgress({ id, received: 0, total: 0, done: true, error: message })
+      throw new Error(`Model download failed: ${message}`)
+    }
+  })
+  modelDownloadChain = run
+  return run as Promise<void>
+}
+
+// ── Cancel-the-current-take shortcut ─────────────────────────────────────────
+
+/** Arm or disarm a temporary global Esc that abandons the in-progress take.
+ *  Kept narrow — only live while actually recording — so it never eats an Esc
+ *  the user meant for their editor. */
+function setCancelShortcut(on: boolean): void {
+  if (on === cancelShortcutOn) return
+  if (on) {
+    try {
+      cancelShortcutOn = globalShortcut.register('Escape', () => {
+        win?.webContents.send('whisper:cancel')
+      })
+    } catch {
+      cancelShortcutOn = false
+    }
+  } else {
+    try {
+      globalShortcut.unregister('Escape')
+    } catch {
+      // never registered
+    }
+    cancelShortcutOn = false
+  }
+}
+
 /**
  * Run whisper.cpp against a 16 kHz mono WAV, copy the transcript to the system
  * clipboard, and return it alongside how the AI polish pass resolved. The
  * renderer records via the Web Audio API and hands us the encoded WAV bytes.
  */
 async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
-  if (!existsSync(MODEL_PATH)) {
-    throw new Error(`Whisper model not found at ${MODEL_PATH}`)
+  // Resolve the chosen model, falling back to the always-bundled base.en if its
+  // file isn't on disk (e.g. a download that never finished).
+  let modelFile = modelFilePath(settings().model)
+  if (!existsSync(modelFile)) modelFile = modelFilePath('base.en')
+  if (!existsSync(modelFile)) {
+    throw new Error(`Whisper model not found at ${modelFile}`)
   }
 
   const dir = await mkdtemp(path.join(tmpdir(), 'whisper-flow-'))
@@ -883,16 +1573,23 @@ async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
 
   // Detect the active app the moment dictation stops — while the user's target
   // window is still frontmost (the pill never takes focus). The lookup overlaps
-  // whisper-cli and is only needed when the polish pass is on.
-  const activeAppPromise: Promise<string | undefined> = settings().useLlmPolish
+  // whisper-cli and is needed for the polish pass and for the history entry.
+  const wantActiveApp = settings().useLlmPolish || settings().saveHistory
+  const activeAppPromise: Promise<string | undefined> = wantActiveApp
     ? detectActiveApp()
     : Promise.resolve(undefined)
+
+  // A non-empty custom vocabulary is handed to whisper as an initial prompt,
+  // biasing it toward those spellings. Clamp the length so a huge list can't
+  // blow out the command line.
+  const vocab = settings().vocabulary
+  const promptArg = vocab.length ? ['--prompt', vocab.join(', ').slice(0, 900)] : []
 
   try {
     await writeFile(wavPath, wavBytes)
 
     const args = [
-      '-m', MODEL_PATH,
+      '-m', modelFile,
       '-f', wavPath,
       '-nt', // no timestamps
       '-otxt', // write the plain transcript to <wavPath>.txt
@@ -900,6 +1597,7 @@ async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
       '--entropy-thold', '2.4', // fail a decode that gets too random
       '--logprob-thold', '-1.0', // fail a decode whose tokens are too unlikely
       '-t', String(Math.max(1, availableParallelism() - 1)),
+      ...promptArg,
     ]
 
     try {
@@ -926,7 +1624,7 @@ async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
     // pastes nor copies, and the pill closes quietly.
     const sanitized = sanitizeTranscript(joined)
     if (!sanitized) {
-      return { text: '', polish: 'off' }
+      return { text: '', polish: 'off', autoPasteBlocked: false }
     }
 
     let text = dropHallucinations(cleanTranscript(sanitized, stripFillerWords))
@@ -948,15 +1646,37 @@ async function transcribe(wavBytes: Uint8Array): Promise<TranscribeResult> {
       }
     }
 
-    // Final guard: whatever cleaner/polish path produced `text`, nothing
-    // untrusted reaches the clipboard or a synthetic paste unscrubbed.
+    // User find/replace rules, then the final guard: whatever cleaner/polish
+    // path produced `text`, nothing untrusted reaches the clipboard or a
+    // synthetic paste unscrubbed.
+    text = applyReplacements(text, settings().replacements)
     text = scrubText(text)
 
+    // Auto-paste needs macOS Accessibility trust; without it the synthetic
+    // Cmd+V is silently swallowed. Detect that up front and leave the text on
+    // the clipboard with a flag so the renderer can explain what happened.
+    let autoPasteBlocked = false
     if (text) {
-      if (autoPaste) await triggerSystemPaste(text)
-      else await clipboard.writeText(text)
+      if (autoPaste && process.platform === 'darwin' && !getAccessibilityStatus()) {
+        await clipboard.writeText(text)
+        autoPasteBlocked = true
+      } else if (autoPaste) {
+        await triggerSystemPaste(text)
+      } else {
+        await clipboard.writeText(text)
+      }
     }
-    return { text, polish }
+
+    if (autoPasteBlocked !== lastAutoPasteBlocked) {
+      lastAutoPasteBlocked = autoPasteBlocked
+      refreshTray()
+    }
+
+    if (text && settings().saveHistory) {
+      addHistoryEntry(text, await activeAppPromise)
+    }
+
+    return { text, polish, autoPasteBlocked }
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -1025,13 +1745,43 @@ async function rateLimitedTranscribe(wavBytes: Uint8Array): Promise<TranscribeRe
 
 app.whenReady().then(() => {
   store = new Store<Settings>({ defaults: DEFAULT_SETTINGS })
+  // One-time upgrade from the old shared hotkey+mode shape (see the doc
+  // comment on migrateLegacyHotkeySettings) — must run before anything else
+  // reads settings().
+  const legacyPatch = migrateLegacyHotkeySettings(store.store as unknown as Record<string, unknown>)
+  if (legacyPatch) {
+    store.set(legacyPatch)
+    store.delete('hotkey' as keyof Settings)
+    store.delete('dictationMode' as keyof Settings)
+  }
+  onboardingStore = new Store<{ completed: boolean }>({
+    name: 'onboarding',
+    defaults: { completed: false },
+  })
+  historyStore = new Store<{ entries: HistoryEntry[] }>({
+    name: 'history',
+    defaults: { entries: [] },
+  })
 
   // Windows: group the app's windows and notifications under a stable identity
   // (must match electron-builder's appId) rather than the default per-exe one.
   app.setAppUserModelId('com.lucidtype.app')
 
+  app.setAboutPanelOptions({
+    applicationName: 'Lucid Type',
+    applicationVersion: app.getVersion(),
+    version: '',
+    copyright: 'Local-first dictation. On-device transcription by whisper.cpp.',
+    website: 'https://github.com/V0idyy-0/Lucid.Type',
+    iconPath: APP_ICON,
+  })
+
   // A menu-bar / system-tray resident app — no dock icon on macOS.
   if (process.platform === 'darwin') app.dock?.hide()
+
+  // Bring the OS login item in line with the setting (registers a fresh
+  // install's default, honours a returning user's choice).
+  syncLoginItem()
 
   // Let the renderer reach the microphone.
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
@@ -1048,6 +1798,45 @@ app.whenReady().then(() => {
   ipcMain.on('settings:open', () => openSettings())
   ipcMain.on('settings:close', () => settingsWin?.close())
 
+  // Onboarding: first-run permission checks + completion flag.
+  ipcMain.handle('permissions:status', () => getPermissionStatus())
+  ipcMain.handle('permissions:request-microphone', () => requestMicrophoneAccess())
+  ipcMain.handle('permissions:request-accessibility', () => requestAccessibilityAccess())
+  ipcMain.on('permissions:open-settings', (_event, kind: 'microphone' | 'accessibility') =>
+    openPermissionSettings(kind),
+  )
+  ipcMain.handle('onboarding:get-completed', () => onboardingStore.get('completed'))
+  ipcMain.on('onboarding:complete', () => {
+    onboardingStore.set('completed', true)
+    onboardingWin?.close()
+  })
+
+  // Dictation history.
+  ipcMain.handle('history:list', () => historyStore.get('entries', []))
+  ipcMain.handle('history:delete', (_event, id: string) => {
+    const kept = historyStore.get('entries', []).filter((e) => e.id !== id)
+    historyStore.set('entries', kept)
+    historyWin?.webContents.send('history:changed')
+    return kept
+  })
+  ipcMain.handle('history:clear', () => {
+    historyStore.set('entries', [])
+    historyWin?.webContents.send('history:changed')
+    return []
+  })
+  ipcMain.on('history:open', () => openHistory())
+  ipcMain.on('clipboard:write', (_event, text: string) => {
+    if (typeof text === 'string' && text) clipboard.writeText(text.slice(0, 100_000))
+  })
+
+  // Whisper model picker + on-demand downloads.
+  ipcMain.handle('models:list', () => modelStatuses())
+  ipcMain.handle('models:download', async (_event, id: ModelId) => {
+    if (!(id in MODELS)) throw new Error(`Unknown model "${id}"`)
+    await downloadModel(id)
+    return modelStatuses()
+  })
+
   ipcMain.on('app:close', () => win?.close())
   ipcMain.on('app:minimize', () => win?.minimize())
   ipcMain.on('app:quit', () => app.quit())
@@ -1061,9 +1850,46 @@ app.whenReady().then(() => {
     else win.hide()
   })
 
+  // Arm the Esc-to-cancel shortcut only while a take is actually being recorded.
+  ipcMain.on('whisper:recording', (_event, recording: boolean) => setCancelShortcut(!!recording))
+
+  // About window + update check.
+  ipcMain.handle('app:get-version', () => app.getVersion())
+  ipcMain.on('about:open', () => openAbout())
+  ipcMain.handle('updates:check', () => runUpdateCheck())
+  ipcMain.handle('updates:get-status', () =>
+    lastUpdateResult ?? { current: app.getVersion(), updateAvailable: false, checkedAt: 0 },
+  )
+  ipcMain.on('updates:open-download', () => {
+    const url = lastUpdateResult?.url
+    if (url) void shell.openExternal(url)
+  })
+  // Guarded external-link opener for the About window's links.
+  ipcMain.on('app:open-external', (_event, url: string) => {
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol === 'https:' && parsed.hostname === 'github.com') {
+        void shell.openExternal(parsed.toString())
+      }
+    } catch {
+      // not a URL — ignore
+    }
+  })
+
   registerHotkey()
   createTray()
   createWindow()
+
+  if (!onboardingStore.get('completed')) openOnboarding()
+
+  // Check for a newer release shortly after startup, then once a day, unless
+  // the user turned it off.
+  if (settings().autoCheckUpdates) {
+    setTimeout(() => void runUpdateCheck(), 8000)
+    setInterval(() => {
+      if (settings().autoCheckUpdates) void runUpdateCheck()
+    }, 24 * 60 * 60 * 1000)
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()

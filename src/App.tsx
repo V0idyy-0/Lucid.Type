@@ -2,7 +2,16 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import { DEFAULT_SETTINGS, type Settings } from './settings'
 import './App.css'
 
-type Status = 'idle' | 'recording' | 'transcribing' | 'error'
+type Status = 'idle' | 'recording' | 'transcribing'
+
+/** Map a caught transcription error to a short pill notice. */
+function errorNotice(err: unknown): string {
+  const msg = err instanceof Error ? err.message : ''
+  if (/busy/i.test(msg)) return 'Transcription is busy — try again'
+  if (/too long/i.test(msg)) return 'Recording was too long'
+  if (/model not found/i.test(msg)) return 'Speech model is missing'
+  return 'Transcription failed'
+}
 
 const TARGET_SAMPLE_RATE = 16_000
 
@@ -250,10 +259,11 @@ function App() {
       setStatus('recording')
     } catch (err) {
       console.error(err instanceof Error ? err.message : 'Could not access the microphone')
-      setStatus('error')
+      flashNotice('Microphone unavailable')
+      setStatus('idle')
       stopGraph()
     }
-  }, [stopGraph])
+  }, [stopGraph, flashNotice])
 
   const stopAndTranscribe = useCallback(async () => {
     const ctx = audioCtxRef.current
@@ -293,14 +303,16 @@ function App() {
       if (!window.whisperFlow) {
         throw new Error('Run inside the Electron app to transcribe')
       }
-      const { text, polish } = await window.whisperFlow.transcribe(wav)
+      const { text, polish, autoPasteBlocked } = await window.whisperFlow.transcribe(wav)
       setStatus('idle')
       if (!text) flashNotice('No speech detected')
+      else if (autoPasteBlocked) flashNotice('Copied — enable Accessibility to auto-paste')
       else if (polish === 'polished') flashNotice('Polished with AI')
       else if (polish === 'fallback') flashNotice('Ollama unavailable — basic cleanup')
     } catch (err) {
       console.error(err instanceof Error ? err.message : 'Transcription failed')
-      setStatus('error')
+      flashNotice(errorNotice(err))
+      setStatus('idle')
     }
   }, [stopGraph, flashNotice])
 
@@ -309,8 +321,28 @@ function App() {
     else if (status !== 'transcribing') void startRecording()
   }, [status, startRecording, stopAndTranscribe])
 
+  // Abandon the current take without transcribing — driven by a temporary
+  // global Esc shortcut the main process registers only while recording.
+  const cancelRecording = useCallback(() => {
+    if (status !== 'recording') return
+    stopGraph()
+    chunksRef.current = []
+    peakRmsRef.current = 0
+    pttHeldRef.current = false
+    setStatus('idle')
+    flashNotice('Cancelled')
+  }, [status, stopGraph, flashNotice])
+
   // The Alt+Space global hotkey drives the same start/stop flow as a tap.
   useEffect(() => window.whisperFlow?.onToggle(toggle), [toggle])
+  useEffect(() => window.whisperFlow?.onCancel?.(cancelRecording), [cancelRecording])
+
+  // Let the main process arm/disarm the Esc-to-cancel shortcut in lockstep with
+  // the recording state — narrower than the pill's visibility so a notice flash
+  // never swallows the user's Esc key.
+  useEffect(() => {
+    window.whisperFlow?.setRecording?.(status === 'recording')
+  }, [status])
 
   // Push-to-talk: the main process sends explicit start/stop events bracketing
   // the held hotkey, rather than a single toggle.
@@ -336,9 +368,10 @@ function App() {
     }
   }, [status, startRecording, stopAndTranscribe])
 
-  // The pill only exists while dictation is active. Keep the overlay window's
-  // visibility in lockstep so an empty transparent window never lingers.
-  const pillVisible = status === 'recording' || notice !== null
+  // The pill is on screen while recording, while whisper runs, and for the
+  // brief life of a transient notice. Keep the overlay window's visibility in
+  // lockstep so an empty transparent window never lingers.
+  const pillVisible = status === 'recording' || status === 'transcribing' || notice !== null
   useEffect(() => {
     window.whisperFlow?.setPillVisible(pillVisible)
   }, [pillVisible])
@@ -346,16 +379,18 @@ function App() {
   // Nothing shows when we're idle and there's no transient notice.
   if (!pillVisible) return null
 
+  const ariaLabel = notice ?? (status === 'transcribing' ? 'Transcribing' : 'Listening — tap to stop')
+
   return (
     <div className="pill-stage">
-      <button
-        type="button"
-        onClick={toggle}
-        className="pill"
-        aria-label={notice ?? 'Listening — tap to stop'}
-      >
+      <button type="button" onClick={toggle} className="pill" aria-label={ariaLabel}>
         {notice ? (
           <span className="pill__text">{notice}</span>
+        ) : status === 'transcribing' ? (
+          <>
+            <span className="pill__spinner" aria-hidden />
+            <span className="pill__text">Transcribing…</span>
+          </>
         ) : (
           <>
             <WaveBars analyserRef={analyserRef} />

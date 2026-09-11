@@ -40,3 +40,25 @@
   letter-spacing: 0.01em;
   opacity: 0.85;
 }
+
+/* Shown while whisper runs — a small accent-coloured ring. */
+.pill__spinner {
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-top-color: var(--accent);
+  animation: pill-spin 0.7s linear infinite;
+}
+
+@keyframes pill-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill__spinner {
+    animation: none;
+  }
+}

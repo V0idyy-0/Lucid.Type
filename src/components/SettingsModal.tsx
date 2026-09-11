@@ -10,10 +10,13 @@ import {
 import {
   ACCENT_SWATCHES,
   DEFAULT_SETTINGS,
-  type DictationMode,
+  type ModelId,
+  type Replacement,
   type Settings,
 } from '../settings'
-import { validateShortcut } from '../utils/shortcutValidator'
+import type { ModelDownloadProgress, ModelStatus, UpdateCheckResult } from '../whisper-flow'
+import { isModifierOnlyShortcut, validateShortcut } from '../utils/shortcutValidator'
+import logo from '../assets/logo.svg'
 
 const isMac = typeof navigator !== 'undefined' && navigator.userAgent.includes('Mac')
 
@@ -39,6 +42,31 @@ const COLOR = isMac
     }
 /** Apple system blue — active nav pill and "on" toggles. */
 const APPLE_BLUE = '#0063e5'
+
+// ── About / links ─────────────────────────────────────────────────────────
+const REPO = 'https://github.com/V0idyy-0/Lucid.Type'
+const ABOUT_LINKS = [
+  { label: 'Releases', url: `${REPO}/releases` },
+  { label: 'Report an issue', url: `${REPO}/issues` },
+]
+
+/** One line describing where the app stands relative to the latest release. */
+function updateSummary(checking: boolean, status: UpdateCheckResult | null): string {
+  if (checking) return 'Checking for updates…'
+  if (!status || status.checkedAt === 0) return 'Check GitHub for a newer release'
+  if (status.error) return status.error
+  if (status.updateAvailable) return `Version ${status.latest} is available`
+  return "You're on the latest version"
+}
+
+/** GitHub mark, inlined so there's no icon dependency to ship. */
+function GithubGlyph() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58 0-.29-.01-1.04-.02-2.05-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.34-5.47-5.96 0-1.32.47-2.39 1.24-3.23-.12-.3-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.23 0 4.63-2.81 5.65-5.49 5.95.43.37.81 1.1.81 2.22 0 1.61-.01 2.9-.01 3.29 0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12.5C24 5.87 18.63.5 12 .5Z" />
+    </svg>
+  )
+}
 
 const MODIFIER_CODES = new Set([
   'ShiftLeft',
@@ -128,6 +156,196 @@ function prettyKey(accelerator: string): string {
   return keyParts(accelerator).join(isMac ? ' ' : ' + ')
 }
 
+/** A held modifier, tracked by its own flag rather than merged into the
+ *  "CommandOrControl" pseudo-token {@link toAccelerator} uses — needed so a
+ *  modifier-only capture (see {@link HotkeyRecorder}) can tell physical
+ *  Control and Command apart, since e.g. "Control+Alt" and "Command+Alt" are
+ *  different combos there, unlike a regular modifier+key shortcut. */
+type ModifierToken = 'Control' | 'Command' | 'Alt' | 'Shift'
+const MODIFIER_TOKEN_ORDER: readonly ModifierToken[] = ['Control', 'Command', 'Alt', 'Shift']
+
+/** Which modifiers a keyboard event currently has held, as literal tokens. */
+function heldModifierTokens(e: ReactKeyboardEvent): Set<ModifierToken> {
+  const held = new Set<ModifierToken>()
+  if (e.ctrlKey) held.add('Control')
+  if (e.metaKey) held.add('Command')
+  if (e.altKey) held.add('Alt')
+  if (e.shiftKey) held.add('Shift')
+  return held
+}
+
+/**
+ * A capture-on-click hotkey button: shows the current accelerator as
+ * {@link KeyBadge}s, and on click starts listening for the next keydown to
+ * rebind it. Self-contained (owns its own capture/error state) so the toggle
+ * and push-to-talk rows in the Shortcuts tab can each have one independently.
+ * `otherValue` is the sibling row's current accelerator, rejected as a
+ * duplicate so the two triggers can never collide. `allowClear` shows a
+ * control to reset the value to `''` (only meaningful for push-to-talk, where
+ * empty is a valid "disabled" state). `allowModifierOnly` additionally lets
+ * the user finish a capture by holding two or more modifiers together and
+ * releasing them, with no regular key — push-to-talk's alternative to a
+ * modifier+key combo (e.g. Wispr Flow's "hold Control+Option" fallback).
+ * Toggle mode doesn't offer this: `electron.globalShortcut` can't register a
+ * modifier-only accelerator, so it wouldn't actually work as a toggle key.
+ */
+function HotkeyRecorder({
+  value,
+  otherValue,
+  accent,
+  allowClear,
+  allowModifierOnly,
+  onCapturingChange,
+  onChange,
+}: {
+  value: string
+  otherValue: string
+  accent: string
+  allowClear?: boolean
+  allowModifierOnly?: boolean
+  onCapturingChange?: (capturing: boolean) => void
+  onChange: (accelerator: string) => void
+}) {
+  const [capturing, setCapturing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  // Modifiers seen at any point during the in-progress capture attempt, for
+  // the modifier-only completion path below. Cleared whenever a capture
+  // attempt starts or ends.
+  const heldMods = useRef<Set<ModifierToken>>(new Set())
+
+  const setCapturingState = (next: boolean) => {
+    setCapturing(next)
+    onCapturingChange?.(next)
+  }
+
+  const finish = (accelerator: string) => {
+    const platform = window.whisperFlow?.platform ?? (isMac ? 'darwin' : 'win32')
+    const { ok, error: validationError } = validateShortcut(accelerator, { platform })
+    if (!ok) {
+      setError(validationError)
+      return
+    }
+    if (otherValue && accelerator === otherValue) {
+      setError('Already used by the other shortcut')
+      return
+    }
+
+    setError(null)
+    setCapturingState(false)
+    btnRef.current?.blur()
+    onChange(accelerator)
+  }
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (e.key === 'Escape') {
+      setCapturingState(false)
+      setError(null)
+      heldMods.current.clear()
+      return
+    }
+    if (allowModifierOnly) {
+      for (const mod of heldModifierTokens(e)) heldMods.current.add(mod)
+    }
+    const { accelerator, complete } = toAccelerator(e)
+    if (!complete) return
+    finish(accelerator)
+  }
+
+  // Only relevant when `allowModifierOnly`: releasing the last held modifier
+  // with no regular key pressed yet finishes the capture as that modifier
+  // combo, e.g. holding Control+Alt then letting go both.
+  const onKeyUp = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (!allowModifierOnly) return
+    e.preventDefault()
+    e.stopPropagation()
+    if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return // still holding something
+    const mods = heldMods.current
+    heldMods.current = new Set()
+    // Require at least two modifiers — a bare single one (just Shift, say)
+    // is far too easy to trigger by accident to accept as a whole combo.
+    if (mods.size < 2) return
+    finish(MODIFIER_TOKEN_ORDER.filter((m) => mods.has(m)).join('+'))
+  }
+
+  const showsModifierOnlyHint = !capturing && !error && value && isModifierOnlyShortcut(value)
+
+  return (
+    <span className="flex flex-col items-end gap-1">
+      <span className="flex items-center gap-1.5">
+        <button
+          ref={btnRef}
+          type="button"
+          style={NO_DRAG}
+          onClick={() => {
+            setCapturingState(!capturing)
+            setError(null)
+            heldMods.current.clear()
+          }}
+          onKeyDown={capturing ? onKeyDown : undefined}
+          onKeyUp={capturing ? onKeyUp : undefined}
+          onBlur={() => {
+            setCapturingState(false)
+            setError(null)
+            heldMods.current.clear()
+          }}
+          aria-label={`Change shortcut, currently ${value ? prettyKey(value) : 'not set'}`}
+          className="flex shrink-0 items-center gap-1"
+        >
+          {capturing ? (
+            <span
+              className="rounded border px-2 py-0.5 font-mono text-xs"
+              style={{
+                borderColor: accent,
+                color: accent,
+                backgroundColor: 'color-mix(in srgb, currentColor 12%, transparent)',
+              }}
+            >
+              Press keys…
+            </span>
+          ) : value ? (
+            keyParts(value).map((k, i) => <KeyBadge key={i}>{k}</KeyBadge>)
+          ) : (
+            <span className="rounded border border-dashed border-white/15 px-2 py-0.5 text-[11px] text-zinc-500">
+              Not set
+            </span>
+          )}
+        </button>
+        {allowClear && value && !capturing && (
+          <button
+            type="button"
+            style={NO_DRAG}
+            onClick={() => onChange('')}
+            aria-label="Clear shortcut"
+            className="px-0.5 text-sm leading-none text-zinc-500 hover:text-zinc-300"
+          >
+            ×
+          </button>
+        )}
+      </span>
+      {capturing && (
+        <span className="text-[11px] text-zinc-500">
+          Hold a modifier ({isMac ? '⌘ / ⌥ / ⌃' : 'Ctrl / Alt'}) and a key, use a function key
+          {allowModifierOnly ? ', or hold two modifiers alone and release them' : ''}. Esc to cancel.
+        </span>
+      )}
+      {error && (
+        <span className="text-[11px] text-red-400" role="alert">
+          {error}
+        </span>
+      )}
+      {showsModifierOnlyHint && (
+        <span className="max-w-[220px] text-right text-[11px] text-amber-400/80">
+          Won't be blocked from other apps while held, and may conflict with AltGr on some
+          keyboard layouts.
+        </span>
+      )}
+    </span>
+  )
+}
+
 // ── Sidebar icons (16px Lucide glyphs, inlined so there's no dep to ship) ─────
 const TAB_ICON_PATHS: Record<TabId, ReactNode> = {
   general: (
@@ -165,6 +383,12 @@ const TAB_ICON_PATHS: Record<TabId, ReactNode> = {
       <path d="M5 18H3" />
     </>
   ),
+  vocabulary: (
+    <>
+      <path d="M12 7v14" />
+      <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+    </>
+  ),
   appearance: (
     <>
       <circle cx="13.5" cy="6.5" r=".5" fill="currentColor" />
@@ -172,6 +396,13 @@ const TAB_ICON_PATHS: Record<TabId, ReactNode> = {
       <circle cx="8.5" cy="7.5" r=".5" fill="currentColor" />
       <circle cx="6.5" cy="12.5" r=".5" fill="currentColor" />
       <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2Z" />
+    </>
+  ),
+  about: (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 16v-4" />
+      <path d="M12 8h.01" />
     </>
   ),
 }
@@ -198,8 +429,10 @@ function TabIcon({ id }: { id: TabId }) {
 const TABS = [
   { id: 'general', label: 'General' },
   { id: 'shortcuts', label: 'Shortcuts' },
+  { id: 'vocabulary', label: 'Vocabulary' },
   { id: 'models', label: 'AI & Models' },
   { id: 'appearance', label: 'Appearance' },
+  { id: 'about', label: 'About' },
 ] as const
 type TabId = (typeof TABS)[number]['id']
 
@@ -310,6 +543,122 @@ function PillPreview({ accent }: { accent: string }) {
   )
 }
 
+/**
+ * Vocabulary + find/replace editor. Keeps its edits in local state and only
+ * pushes them to the store on blur, so a controlled `<textarea>` doesn't fight
+ * the user's cursor on every keystroke.
+ */
+function VocabularyPanel({
+  vocabulary,
+  replacements,
+  commit,
+}: {
+  vocabulary: string[]
+  replacements: Replacement[]
+  commit: (patch: Partial<Settings>) => void
+}) {
+  const [text, setText] = useState(vocabulary.join('\n'))
+  const [rows, setRows] = useState<Replacement[]>(replacements)
+
+  // Re-sync when the stored value changes from elsewhere (another window, a
+  // reset) — the render-phase "adjust state when a prop changes" pattern, so a
+  // blur-commit round-trip doesn't stomp what the user is mid-edit.
+  const [syncedVocab, setSyncedVocab] = useState(vocabulary)
+  if (vocabulary !== syncedVocab) {
+    setSyncedVocab(vocabulary)
+    setText(vocabulary.join('\n'))
+  }
+  const [syncedRules, setSyncedRules] = useState(replacements)
+  if (replacements !== syncedRules) {
+    setSyncedRules(replacements)
+    setRows(replacements)
+  }
+
+  const commitVocab = () => {
+    const terms = text
+      .split('\n')
+      .map((t) => t.trim())
+      .filter(Boolean)
+    commit({ vocabulary: terms })
+  }
+
+  const commitRows = (next: Replacement[]) => {
+    setRows(next)
+    commit({ replacements: next.filter((r) => r.from.trim()) })
+  }
+
+  const inputClass =
+    'min-w-0 flex-1 rounded-md border border-white/10 bg-[#323234] px-2 py-1 text-[12px] text-[#e1e1e1] outline-none placeholder:text-zinc-600 focus:border-white/25'
+
+  return (
+    <>
+      <CategoryLabel>Spelling hints</CategoryLabel>
+      <p className="pb-2 text-[11px] leading-relaxed text-zinc-500">
+        Names, jargon, and acronyms you want recognised. One per line — Lucid Type feeds them to
+        whisper as a hint.
+      </p>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commitVocab}
+        spellCheck={false}
+        rows={6}
+        placeholder={'Kubernetes\nGraphQL\nNaledi'}
+        className="w-full resize-y rounded-[10px] border border-white/[0.08] bg-[#28282b] p-3 font-mono text-[12px] leading-relaxed text-zinc-100 outline-none focus:border-white/25"
+      />
+
+      <CategoryLabel>Replacements</CategoryLabel>
+      <p className="pb-2 text-[11px] leading-relaxed text-zinc-500">
+        Rewrite finished text — expand shorthand, fix a spelling whisper always gets wrong. Matching
+        is case-insensitive.
+      </p>
+      <div className="flex flex-col gap-2">
+        {rows.map((row, i) => (
+          <div key={i} className="flex items-center gap-2" style={NO_DRAG}>
+            <input
+              value={row.from}
+              onChange={(e) =>
+                setRows(rows.map((r, j) => (j === i ? { ...r, from: e.target.value } : r)))
+              }
+              onBlur={() => commitRows(rows)}
+              placeholder="heard this"
+              className={inputClass}
+            />
+            <span aria-hidden className="text-zinc-600">
+              →
+            </span>
+            <input
+              value={row.to}
+              onChange={(e) =>
+                setRows(rows.map((r, j) => (j === i ? { ...r, to: e.target.value } : r)))
+              }
+              onBlur={() => commitRows(rows)}
+              placeholder="write this"
+              className={inputClass}
+            />
+            <button
+              type="button"
+              aria-label="Remove replacement"
+              onClick={() => commitRows(rows.filter((_, j) => j !== i))}
+              className="shrink-0 rounded-md px-1.5 py-1 text-zinc-500 transition-colors hover:bg-white/10 hover:text-red-400"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+        <button
+          type="button"
+          style={NO_DRAG}
+          onClick={() => setRows([...rows, { from: '', to: '' }])}
+          className="self-start rounded-md border border-white/10 bg-[#323234] px-2.5 py-1 text-[12px] text-zinc-300 transition-colors hover:bg-[#3d3d40]"
+        >
+          Add replacement
+        </button>
+      </div>
+    </>
+  )
+}
+
 export default function SettingsModal() {
   // Outside Electron (e.g. plain Vite) there's nothing to load — fall straight
   // back to the defaults so the window still renders.
@@ -317,15 +666,39 @@ export default function SettingsModal() {
     window.whisperFlow ? null : DEFAULT_SETTINGS,
   )
   const [tab, setTab] = useState<TabId>('general')
-  const [capturing, setCapturing] = useState(false)
-  const [shortcutError, setShortcutError] = useState<string | null>(null)
-  const captureBtnRef = useRef<HTMLButtonElement>(null)
+  // Whether either Shortcuts-tab hotkey recorder is mid-capture — gates the
+  // window-level Escape handler below so Esc cancels the capture instead of
+  // closing Settings.
+  const [capturingHotkey, setCapturingHotkey] = useState(false)
+
+  const [models, setModels] = useState<ModelStatus[]>([])
+  const [download, setDownload] = useState<ModelDownloadProgress | null>(null)
+  const [version, setVersion] = useState('')
+  const [updateStatus, setUpdateStatus] = useState<UpdateCheckResult | null>(null)
+  const [updateDialog, setUpdateDialog] = useState(false)
+  const [checking, setChecking] = useState(false)
 
   useEffect(() => {
     const api = window.whisperFlow
     if (!api) return
     void api.getSettings().then(setSettings)
-    return api.onSettingsChanged(setSettings)
+    void api.listModels().then(setModels)
+    void api.getVersion().then(setVersion)
+    void api.getUpdateStatus().then(setUpdateStatus)
+    const offSettings = api.onSettingsChanged(setSettings)
+    const offProgress = api.onModelDownloadProgress((p) => {
+      setDownload(p.done && !p.error ? null : p)
+      if (p.done) void api.listModels().then(setModels)
+    })
+    const offUpdate = api.onUpdateStatus((next) => {
+      setUpdateStatus(next)
+      setChecking(false)
+    })
+    return () => {
+      offSettings()
+      offProgress()
+      offUpdate()
+    }
   }, [])
 
   // Every interaction persists straight to electron-store; there's no Save step.
@@ -334,19 +707,62 @@ export default function SettingsModal() {
     void window.whisperFlow?.updateSettings(patch)
   }, [])
 
+  const chooseModel = useCallback(
+    (id: ModelId) => {
+      const status = models.find((m) => m.id === id)
+      if (status && !status.downloaded) {
+        // Download first; only switch to it once the file is actually on disk
+        // (until then transcription would fall back to base.en anyway).
+        setDownload({ id, received: 0, total: 0 })
+        void window.whisperFlow
+          ?.downloadModel(id)
+          .then((list) => {
+            setModels(list)
+            setDownload(null)
+            commit({ model: id })
+          })
+          .catch((err: unknown) => {
+            setDownload({
+              id,
+              received: 0,
+              total: 0,
+              done: true,
+              error: err instanceof Error ? err.message : 'Download failed',
+            })
+          })
+        return
+      }
+      commit({ model: id })
+    },
+    [models, commit],
+  )
+
   const close = useCallback(() => {
     if (window.whisperFlow) window.whisperFlow.closeSettings()
     else window.close()
   }, [])
 
-  // Esc closes the window — unless we're mid hotkey-capture, where it cancels.
+  // Manual update check — pops the result dialog, mirroring the tray item.
+  const runUpdateCheck = useCallback(() => {
+    setUpdateDialog(true)
+    setChecking(true)
+    void window.whisperFlow?.checkForUpdates().then((next) => {
+      setUpdateStatus(next)
+      setChecking(false)
+    })
+  }, [])
+
+  // Esc closes the update dialog if it's open, else the window — unless we're
+  // mid hotkey-capture, where it cancels the capture instead.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !capturing) close()
+      if (e.key !== 'Escape' || capturingHotkey) return
+      if (updateDialog) setUpdateDialog(false)
+      else close()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [capturing, close])
+  }, [capturingHotkey, close, updateDialog])
 
   const platformClass = isMac ? 'platform-mac' : 'platform-win'
 
@@ -363,32 +779,6 @@ export default function SettingsModal() {
 
   const accent = settings.accentColor
 
-  const onCaptureKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
-    e.preventDefault()
-    e.stopPropagation()
-    if (e.key === 'Escape') {
-      setCapturing(false)
-      setShortcutError(null)
-      return
-    }
-    const { accelerator, complete } = toAccelerator(e)
-    if (!complete) return
-
-    // Reject reserved / malformed combos before they reach the store — the
-    // capture stays open so the user can try another key.
-    const platform = window.whisperFlow?.platform ?? (isMac ? 'darwin' : 'win32')
-    const { ok, error } = validateShortcut(accelerator, { platform })
-    if (!ok) {
-      setShortcutError(error)
-      return
-    }
-
-    setShortcutError(null)
-    setCapturing(false)
-    captureBtnRef.current?.blur()
-    commit({ hotkey: accelerator })
-  }
-
   const activeLabel = TABS.find((t) => t.id === tab)?.label ?? ''
 
   const selectClass =
@@ -396,7 +786,7 @@ export default function SettingsModal() {
 
   return (
     <div
-      className={`flex h-screen w-screen overflow-hidden text-zinc-100 antialiased ${platformClass}`}
+      className={`relative flex h-screen w-screen overflow-hidden text-zinc-100 antialiased ${platformClass}`}
       style={{ backgroundColor: COLOR.shell }}
     >
       {/* Left sidebar — draggable chrome. 210px on macOS to clear the traffic lights. */}
@@ -432,14 +822,25 @@ export default function SettingsModal() {
         <div style={DRAG} className="shrink-0 px-5 pt-3">
           <div className="mb-4 flex items-center justify-between border-b border-white/10 pb-3">
             <h1 className="text-[17px] font-bold text-white">{activeLabel}</h1>
-            <button
-              type="button"
-              style={NO_DRAG}
-              onClick={() => window.whisperFlow?.quit()}
-              className="rounded-md border border-white/10 bg-[#323234] px-2.5 py-1 text-[12px] text-zinc-300 transition-colors hover:bg-[#3d3d40]"
-            >
-              Quit app
-            </button>
+            {tab === 'about' ? (
+              <button
+                type="button"
+                style={NO_DRAG}
+                onClick={runUpdateCheck}
+                className="rounded-md border border-white/10 bg-[#323234] px-2.5 py-1 text-[12px] text-zinc-300 transition-colors hover:bg-[#3d3d40]"
+              >
+                Check for Updates…
+              </button>
+            ) : (
+              <button
+                type="button"
+                style={NO_DRAG}
+                onClick={() => window.whisperFlow?.quit()}
+                className="rounded-md border border-white/10 bg-[#323234] px-2.5 py-1 text-[12px] text-zinc-300 transition-colors hover:bg-[#3d3d40]"
+              >
+                Quit app
+              </button>
+            )}
           </div>
         </div>
 
@@ -480,6 +881,70 @@ export default function SettingsModal() {
                   />
                 </CardRow>
               </Card>
+
+              <CategoryLabel>History</CategoryLabel>
+              <Card>
+                <CardRow
+                  title="Save dictation history"
+                  hint="Keep a local log of finished transcripts. Nothing leaves your machine."
+                >
+                  <Toggle
+                    label="Save dictation history"
+                    checked={settings.saveHistory}
+                    accent={accent}
+                    onChange={(v) => commit({ saveHistory: v })}
+                  />
+                </CardRow>
+                <CardRow title="Keep the last" hint="Older entries are dropped automatically">
+                  <select
+                    style={NO_DRAG}
+                    value={settings.historyLimit}
+                    onChange={(e) => commit({ historyLimit: Number(e.target.value) })}
+                    aria-label="History entries to keep"
+                    className={selectClass}
+                    disabled={!settings.saveHistory}
+                  >
+                    {[25, 50, 100, 250, 500].map((n) => (
+                      <option key={n} value={n}>
+                        {n} entries
+                      </option>
+                    ))}
+                  </select>
+                </CardRow>
+                <CardRow title="Dictation history" hint="Open the log, or wipe it">
+                  <span className="flex gap-2" style={NO_DRAG}>
+                    <button
+                      type="button"
+                      onClick={() => window.whisperFlow?.openHistory()}
+                      className={selectClass}
+                    >
+                      Open
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void window.whisperFlow?.clearHistory()}
+                      className="cursor-pointer rounded-md border border-white/10 bg-[#323234] px-2 py-1 text-[12px] text-zinc-300 transition-colors hover:bg-[#3d3d40] hover:text-red-400"
+                    >
+                      Clear
+                    </button>
+                  </span>
+                </CardRow>
+              </Card>
+
+              <CategoryLabel>Startup</CategoryLabel>
+              <Card>
+                <CardRow
+                  title="Launch at login"
+                  hint="Start Lucid Type in the menu bar when you log in — no window, no relaunch"
+                >
+                  <Toggle
+                    label="Launch at login"
+                    checked={settings.launchAtLogin}
+                    accent={accent}
+                    onChange={(v) => commit({ launchAtLogin: v })}
+                  />
+                </CardRow>
+              </Card>
             </>
           )}
 
@@ -488,78 +953,108 @@ export default function SettingsModal() {
               <CategoryLabel>Dictation</CategoryLabel>
               <Card>
                 <CardRow
-                  title="Trigger mode"
-                  hint="How the shortcut controls recording"
+                  title="Toggle shortcut"
+                  hint="Tap once to start, tap again to stop — works anywhere, even in the background"
                   align="start"
                 >
-                  <select
-                    style={NO_DRAG}
-                    value={settings.dictationMode}
-                    onChange={(e) => commit({ dictationMode: e.target.value as DictationMode })}
-                    aria-label="Dictation trigger mode"
-                    className={selectClass}
-                  >
-                    <option value="toggle">Toggle (Press to Start/Stop)</option>
-                    <option value="ptt">Push to Talk (Hold to Record)</option>
-                  </select>
+                  <HotkeyRecorder
+                    value={settings.toggleHotkey}
+                    otherValue={settings.pttHotkey}
+                    accent={accent}
+                    onCapturingChange={setCapturingHotkey}
+                    onChange={(accelerator) => commit({ toggleHotkey: accelerator })}
+                  />
                 </CardRow>
                 <CardRow
-                  title={settings.dictationMode === 'ptt' ? 'Hold to dictate' : 'Toggle dictation'}
-                  hint={
-                    settings.dictationMode === 'ptt'
-                      ? 'Hold this combo to record; release to transcribe'
-                      : 'Works anywhere, even when Lucid Type is in the background'
-                  }
+                  title="Push-to-talk shortcut"
+                  hint="Hold to record, release to transcribe — optional, leave unset to disable"
+                  align="start"
                 >
-                  <button
-                    ref={captureBtnRef}
-                    type="button"
-                    style={NO_DRAG}
-                    onClick={() => {
-                      setCapturing((c) => !c)
-                      setShortcutError(null)
-                    }}
-                    onKeyDown={capturing ? onCaptureKeyDown : undefined}
-                    onBlur={() => {
-                      setCapturing(false)
-                      setShortcutError(null)
-                    }}
-                    aria-label={`Change shortcut, currently ${prettyKey(settings.hotkey)}`}
-                    className="flex shrink-0 items-center gap-1"
-                  >
-                    {capturing ? (
-                      <span
-                        className="rounded border px-2 py-0.5 font-mono text-xs"
-                        style={{
-                          borderColor: accent,
-                          color: accent,
-                          backgroundColor: 'color-mix(in srgb, currentColor 12%, transparent)',
-                        }}
-                      >
-                        Press keys…
-                      </span>
-                    ) : (
-                      keyParts(settings.hotkey).map((k, i) => <KeyBadge key={i}>{k}</KeyBadge>)
-                    )}
-                  </button>
+                  <HotkeyRecorder
+                    value={settings.pttHotkey}
+                    otherValue={settings.toggleHotkey}
+                    accent={accent}
+                    allowClear
+                    allowModifierOnly
+                    onCapturingChange={setCapturingHotkey}
+                    onChange={(accelerator) => commit({ pttHotkey: accelerator })}
+                  />
                 </CardRow>
               </Card>
-              {capturing && (
-                <p className="pt-3 text-xs text-zinc-500">
-                  Hold a modifier ({isMac ? '⌘ / ⌥ / ⌃' : 'Ctrl / Alt'}) and a key, or use a
-                  function key. Esc to cancel.
-                </p>
-              )}
-              {shortcutError && (
-                <p className="pt-2 text-xs text-red-400" role="alert">
-                  {shortcutError}
-                </p>
-              )}
             </>
+          )}
+
+          {tab === 'vocabulary' && (
+            <VocabularyPanel
+              vocabulary={settings.vocabulary}
+              replacements={settings.replacements}
+              commit={commit}
+            />
           )}
 
           {tab === 'models' && (
             <>
+              <CategoryLabel>Speech model</CategoryLabel>
+              <Card>
+                <CardRow
+                  title="Models"
+                  hint="Larger models are more accurate but slower to transcribe"
+                  align="start"
+                >
+                  <select
+                    style={NO_DRAG}
+                    value={settings.model}
+                    onChange={(e) => chooseModel(e.target.value as ModelId)}
+                    aria-label="Whisper model"
+                    className={selectClass}
+                    disabled={!!download && !download.error}
+                  >
+                    {(models.length
+                      ? models
+                      : [{ id: settings.model, label: settings.model, downloaded: true, sizeMB: 0 }]
+                    ).map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                        {m.sizeMB ? ` — ${m.sizeMB} MB` : ''}
+                        {m.downloaded ? '' : ' (download)'}
+                      </option>
+                    ))}
+                  </select>
+                </CardRow>
+              </Card>
+              {settings.model === 'small.en' &&
+                models.find((m) => m.id === 'small.en')?.downloaded && (
+                  <p className="pt-2 text-[11px] leading-relaxed text-zinc-500">
+                    Pro can be a bit slower.
+                  </p>
+                )}
+              {download && !download.error && (
+                <div className="pt-3">
+                  <div className="mb-1 flex justify-between text-[11px] text-zinc-500">
+                    <span>Downloading {download.id}…</span>
+                    {download.total > 0 && (
+                      <span>{Math.round((download.received / download.total) * 100)}%</span>
+                    )}
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full transition-[width] duration-200"
+                      style={{
+                        backgroundColor: accent,
+                        width: download.total
+                          ? `${(download.received / download.total) * 100}%`
+                          : '35%',
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+              {download?.error && (
+                <p className="pt-2 text-xs text-red-400" role="alert">
+                  {download.error}
+                </p>
+              )}
+
               <CategoryLabel>AI Text Polish</CategoryLabel>
               <Card>
                 <CardRow
@@ -631,8 +1126,192 @@ export default function SettingsModal() {
               </div>
             </>
           )}
+
+          {tab === 'about' && (
+            <>
+              <div className="flex flex-col items-center pb-1 pt-1 text-center">
+                <img
+                  src={logo}
+                  alt=""
+                  width={52}
+                  height={49}
+                  className="drop-shadow-[0_4px_20px_rgba(0,0,0,0.45)]"
+                />
+                <h2 className="mt-3 text-[16px] font-semibold text-white">Lucid Type</h2>
+                <p className="mt-0.5 text-[12px] text-zinc-500">
+                  {version ? `Version ${version}` : ' '}
+                </p>
+              </div>
+
+              <CategoryLabel>Version info</CategoryLabel>
+              <Card>
+                <CardRow title="Application" hint="On-device dictation for macOS &amp; Windows">
+                  <span className="text-[13px] text-zinc-300">Lucid Type</span>
+                </CardRow>
+                <CardRow title="Version">
+                  <span className="text-[13px] text-zinc-300">{version || '—'}</span>
+                </CardRow>
+              </Card>
+
+              <CategoryLabel>Software updates</CategoryLabel>
+              <Card>
+                <CardRow
+                  title="Automatically check for updates"
+                  hint="Check GitHub for a newer release on launch and once a day"
+                >
+                  <Toggle
+                    label="Automatically check for updates"
+                    checked={settings.autoCheckUpdates}
+                    accent={accent}
+                    onChange={(v) => commit({ autoCheckUpdates: v })}
+                  />
+                </CardRow>
+                <CardRow title="Check now" hint={updateSummary(checking, updateStatus)}>
+                  {updateStatus?.updateAvailable ? (
+                    <button
+                      type="button"
+                      onClick={() => window.whisperFlow?.openDownloadPage()}
+                      className="rounded-md px-2.5 py-1 text-[12px] font-semibold text-white transition-opacity hover:opacity-90"
+                      style={{ backgroundColor: isMac ? APPLE_BLUE : accent }}
+                    >
+                      Download {updateStatus.latest}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={runUpdateCheck}
+                      disabled={checking}
+                      className={`${selectClass} disabled:opacity-50`}
+                    >
+                      {checking ? 'Checking…' : 'Check for updates'}
+                    </button>
+                  )}
+                </CardRow>
+              </Card>
+
+              <CategoryLabel>Links</CategoryLabel>
+              <button
+                type="button"
+                onClick={() => window.whisperFlow?.openExternalLink(REPO)}
+                className="flex w-full flex-col items-center gap-1.5 rounded-[10px] border border-white/[0.08] py-5 text-zinc-200 transition-colors hover:bg-white/[0.04]"
+                style={{ backgroundColor: COLOR.card }}
+              >
+                <GithubGlyph />
+                <span className="text-[13px] font-medium">GitHub</span>
+              </button>
+              <div className="mt-3 flex justify-center gap-4 text-[12px]">
+                {ABOUT_LINKS.map((l) => (
+                  <button
+                    key={l.url}
+                    type="button"
+                    onClick={() => window.whisperFlow?.openExternalLink(l.url)}
+                    className="text-zinc-400 transition-colors hover:text-zinc-100"
+                  >
+                    {l.label}
+                  </button>
+                ))}
+              </div>
+
+              <p className="mt-6 text-center text-[11px] leading-relaxed text-zinc-600">
+                On-device transcription by whisper.cpp. Nothing leaves your machine.
+              </p>
+            </>
+          )}
         </div>
       </main>
+
+      {updateDialog && (
+        <div
+          className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px]"
+          style={NO_DRAG}
+          onClick={() => setUpdateDialog(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+            className="mx-6 flex w-[300px] flex-col items-center rounded-[16px] border border-white/10 px-6 py-6 text-center shadow-2xl"
+            style={{ backgroundColor: COLOR.card }}
+          >
+            <img
+              src={logo}
+              alt=""
+              width={54}
+              height={51}
+              className="drop-shadow-[0_4px_20px_rgba(0,0,0,0.5)]"
+            />
+            {checking ? (
+              <>
+                <p className="mt-4 text-[15px] font-semibold text-white">
+                  {'Checking for updates…'}
+                </p>
+                <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">
+                  Looking for the latest Lucid Type release.
+                </p>
+              </>
+            ) : updateStatus?.error ? (
+              <>
+                <p className="mt-4 text-[15px] font-semibold text-white">
+                  {"Couldn't check for updates"}
+                </p>
+                <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">
+                  {updateStatus.error}
+                </p>
+              </>
+            ) : updateStatus?.updateAvailable ? (
+              <>
+                <p className="mt-4 text-[15px] font-semibold text-white">Update available</p>
+                <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">
+                  Lucid Type {updateStatus.latest} is available. You have {updateStatus.current}.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="mt-4 text-[15px] font-semibold text-white">
+                  {"You're up to date!"}
+                </p>
+                <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">
+                  Lucid Type {updateStatus?.current || version} is currently the newest version
+                  available.
+                </p>
+              </>
+            )}
+
+            <div className="mt-5 flex w-full gap-2">
+              {!checking && updateStatus?.updateAvailable && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    window.whisperFlow?.openDownloadPage()
+                    setUpdateDialog(false)
+                  }}
+                  className="flex-1 rounded-[10px] py-2 text-[13px] font-semibold text-white transition-opacity hover:opacity-90"
+                  style={{ backgroundColor: isMac ? APPLE_BLUE : accent }}
+                >
+                  Download
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setUpdateDialog(false)}
+                disabled={checking}
+                className={
+                  !checking && updateStatus?.updateAvailable
+                    ? 'flex-1 rounded-[10px] border border-white/10 bg-white/5 py-2 text-[13px] text-zinc-200 transition-colors hover:bg-white/10'
+                    : 'flex-1 rounded-[10px] py-2 text-[13px] font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-60'
+                }
+                style={
+                  !checking && updateStatus?.updateAvailable
+                    ? undefined
+                    : { backgroundColor: isMac ? APPLE_BLUE : accent }
+                }
+              >
+                {checking ? 'Please wait…' : updateStatus?.updateAvailable ? 'Later' : 'OK'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
