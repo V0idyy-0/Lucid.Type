@@ -10,9 +10,44 @@ on:
     paths-ignore: ['**.md', 'LICENSE', '.gitignore']
   workflow_dispatch:
 
+# Cancel superseded runs (e.g. a force-push or a follow-up commit on the
+# same PR) instead of letting them burn minutes to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Cheap sanity check for PRs: compile + lint on a single Linux runner
+  # (1x minute multiplier) instead of the full macOS/Windows package
+  # matrix (10x/2x multiplier) that only push/tag builds need.
+  pr-check:
+    name: PR check (lint + build)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build renderer and main process
+        run: |
+          npm run build
+          npm run build:electron
+
   build:
     name: Build (${{ matrix.target }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -77,8 +112,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Only upload on a tag build — that's the only run that publishes a
-      # release. Branch/PR builds still compile + package to catch breakage,
-      # but store nothing.
+      # release. Plain pushes to main still compile + package to catch
+      # breakage, but store nothing.
       - name: Upload Lucid Type artifacts
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
