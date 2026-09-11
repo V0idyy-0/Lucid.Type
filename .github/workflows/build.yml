@@ -96,6 +96,11 @@ jobs:
       - name: Build whisper.cpp CLI
         shell: bash
         run: npm run fetch:whisper
+        env:
+          # Tell the script which Windows arch it's targeting explicitly —
+          # PROCESSOR_ARCHITECTURE inside Git Bash on windows-11-arm reports
+          # the WOW64-emulated arch, not the real one, so it can't be trusted.
+          WHISPER_CLI_WIN_ARCH: ${{ contains(matrix.target, 'arm64') && 'arm64' || '' }}
 
       - name: Lint
         if: matrix.target == 'macos'

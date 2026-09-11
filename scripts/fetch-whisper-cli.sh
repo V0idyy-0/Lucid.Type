@@ -65,7 +65,21 @@ if [ "$IS_WIN" = 1 ]; then
   # supported for ARM, use clang") — switch the Visual Studio generator's
   # toolset to clang-cl, which ships with the VS "Desktop development with
   # C++" workload on the windows-11-arm runner. x64 keeps plain cl.exe.
-  if [ "${PROCESSOR_ARCHITECTURE:-}" = "ARM64" ]; then
+  #
+  # Arch comes from WHISPER_CLI_WIN_ARCH (set by CI from the job matrix) —
+  # PROCESSOR_ARCHITECTURE isn't trustworthy here: Git Bash on the
+  # windows-11-arm runner can run under WOW64 emulation, in which case that
+  # var reports the emulated arch and the real one only shows up in
+  # PROCESSOR_ARCHITEW6432. Fall back to checking both for local/manual runs.
+  IS_ARM64_WIN=0
+  if [ -n "${WHISPER_CLI_WIN_ARCH:-}" ]; then
+    [ "$WHISPER_CLI_WIN_ARCH" = "arm64" ] && IS_ARM64_WIN=1
+  else
+    case "${PROCESSOR_ARCHITEW6432:-${PROCESSOR_ARCHITECTURE:-}}" in
+      ARM64) IS_ARM64_WIN=1 ;;
+    esac
+  fi
+  if [ "$IS_ARM64_WIN" = 1 ]; then
     CMAKE_ARGS+=( -T ClangCL )
   fi
 fi
