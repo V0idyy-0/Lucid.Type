@@ -61,6 +61,13 @@ if [ "$IS_WIN" = 1 ]; then
     -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
   )
+  # ggml's CPU backend refuses to build with cl.exe on ARM64 ("MSVC is not
+  # supported for ARM, use clang") — switch the Visual Studio generator's
+  # toolset to clang-cl, which ships with the VS "Desktop development with
+  # C++" workload on the windows-11-arm runner. x64 keeps plain cl.exe.
+  if [ "${PROCESSOR_ARCHITECTURE:-}" = "ARM64" ]; then
+    CMAKE_ARGS+=( -T ClangCL )
+  fi
 fi
 
 cmake "${CMAKE_ARGS[@]}"
