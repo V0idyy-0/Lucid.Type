@@ -3,13 +3,6 @@
  * process persists with electron-store. The renderer keeps a matching copy of
  * this contract in `src/settings.ts` — keep the two in step.
  */
-/**
- * How the global hotkey drives dictation:
- * - `toggle` — tap once to start, tap again to stop (uses `globalShortcut`).
- * - `ptt`    — hold to record, release to transcribe (uses a raw keyboard hook).
- */
-export type DictationMode = 'toggle' | 'ptt'
-
 /** A literal find/replace applied to every finished transcript. */
 export type Replacement = { from: string; to: string }
 
@@ -18,10 +11,14 @@ export const MODEL_IDS = ['tiny.en', 'base.en', 'small.en'] as const
 export type ModelId = (typeof MODEL_IDS)[number]
 
 export type Settings = {
-  /** Global accelerator that reveals the pill and toggles dictation. */
-  hotkey: string
-  /** Whether the hotkey toggles dictation or is held down for push-to-talk. */
-  dictationMode: DictationMode
+  /** Global accelerator that reveals the pill and toggles dictation with a
+   *  tap. Empty falls back to the default (there's always a toggle key). */
+  toggleHotkey: string
+  /** Accelerator held down to record push-to-talk style, release to
+   *  transcribe. Empty means push-to-talk is disabled — unlike the toggle
+   *  hotkey, there's no default to fall back to. Independent of
+   *  `toggleHotkey`; both can be bound and used at the same time. */
+  pttHotkey: string
   /** Fire a synthetic paste after transcription so the text lands in the app. */
   autoPaste: boolean
   /** Drop "um", "uh", "like", "you know" from the transcript. */
@@ -53,8 +50,8 @@ export type Settings = {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  hotkey: 'Alt+Space',
-  dictationMode: 'toggle',
+  toggleHotkey: 'Alt+Space',
+  pttHotkey: '',
   autoPaste: true,
   stripFillerWords: true,
   useLlmPolish: false,
@@ -67,6 +64,37 @@ export const DEFAULT_SETTINGS: Settings = {
   replacements: [],
   launchAtLogin: true,
   autoCheckUpdates: true,
+}
+
+/** Shape of a pre-split persisted settings file, before the toggle and
+ *  push-to-talk hotkeys became independent fields. */
+interface LegacyHotkeySettings {
+  hotkey?: string
+  dictationMode?: 'toggle' | 'ptt'
+}
+
+/**
+ * One-time upgrade of a raw electron-store record from the old shared
+ * `hotkey` + `dictationMode` shape to independent `toggleHotkey`/`pttHotkey`
+ * fields. Returns `null` when there's nothing to migrate (a fresh install, or
+ * a store already on the new shape). electron-store never renames or drops
+ * keys it doesn't recognise on its own, so without this the old fields would
+ * sit inert on disk while the new ones silently default, discarding whatever
+ * hotkey the user had configured.
+ */
+export function migrateLegacyHotkeySettings(
+  raw: Record<string, unknown>,
+): Partial<Settings> | null {
+  const legacy = raw as LegacyHotkeySettings
+  if (typeof legacy.hotkey !== 'string') return null
+
+  const hotkey = legacy.hotkey.trim()
+  if (legacy.dictationMode === 'ptt') {
+    // The user's one hotkey *was* their push-to-talk key — carry it over and
+    // give toggle the (new) default rather than leaving it unbound.
+    return { pttHotkey: hotkey, toggleHotkey: DEFAULT_SETTINGS.toggleHotkey }
+  }
+  return { toggleHotkey: hotkey || DEFAULT_SETTINGS.toggleHotkey, pttHotkey: '' }
 }
 
 /** Per-entry / per-list caps so an untrusted patch can't bloat the store or the
@@ -104,27 +132,48 @@ function cleanReplacements(value: unknown): Replacement[] | undefined {
   return out
 }
 
+/** An Electron accelerator is a short "+"-joined list of ASCII key tokens. */
+const ACCELERATOR_RE = /^[A-Za-z0-9 +]+$/
+
 /**
  * Keep only recognised keys with well-typed values from an untrusted patch —
  * IPC payloads and tray clicks both flow through here before they touch disk.
+ * `current` is the settings already on disk, needed to reject a patch that
+ * would make `toggleHotkey` and `pttHotkey` collide (the field being changed
+ * loses, the other field's existing value wins).
  */
-export function sanitizeSettings(patch: Partial<Settings> | null | undefined): Partial<Settings> {
+export function sanitizeSettings(
+  patch: Partial<Settings> | null | undefined,
+  current: Settings = DEFAULT_SETTINGS,
+): Partial<Settings> {
   const out: Partial<Settings> = {}
   if (!patch || typeof patch !== 'object') return out
 
-  // An Electron accelerator is a short "+"-joined list of ASCII key tokens.
-  // Reject anything outside that shape so junk never reaches globalShortcut or
-  // the persisted store; the renderer already runs a fuller validateShortcut().
-  if (
-    typeof patch.hotkey === 'string' &&
-    patch.hotkey.trim() &&
-    patch.hotkey.trim().length <= 80 &&
-    /^[A-Za-z0-9 +]+$/.test(patch.hotkey.trim())
-  ) {
-    out.hotkey = patch.hotkey.trim()
+  // Reject anything outside the accelerator shape so junk never reaches
+  // globalShortcut or the persisted store; the renderer already runs a
+  // fuller validateShortcut(). Unlike toggleHotkey, an empty pttHotkey is a
+  // valid, meaningful value (push-to-talk disabled).
+  if (typeof patch.toggleHotkey === 'string') {
+    const trimmed = patch.toggleHotkey.trim()
+    if (trimmed && trimmed.length <= 80 && ACCELERATOR_RE.test(trimmed)) {
+      out.toggleHotkey = trimmed
+    }
   }
-  if (patch.dictationMode === 'toggle' || patch.dictationMode === 'ptt') {
-    out.dictationMode = patch.dictationMode
+  if (typeof patch.pttHotkey === 'string') {
+    const trimmed = patch.pttHotkey.trim()
+    if (trimmed === '' || (trimmed.length <= 80 && ACCELERATOR_RE.test(trimmed))) {
+      out.pttHotkey = trimmed
+    }
+  }
+  // Two non-empty hotkeys bound to the same combo would be ambiguous — let
+  // whichever field isn't being changed by this patch win, and drop the one
+  // that is.
+  const nextToggle = out.toggleHotkey ?? current.toggleHotkey
+  const nextPtt = out.pttHotkey ?? current.pttHotkey
+  if (nextToggle && nextToggle === nextPtt) {
+    if ('toggleHotkey' in out) delete out.toggleHotkey
+    else delete out.pttHotkey
+    console.warn(`Ignored hotkey change: "${nextToggle}" is already used by the other trigger.`)
   }
   if (typeof patch.autoPaste === 'boolean') out.autoPaste = patch.autoPaste
   if (typeof patch.stripFillerWords === 'boolean') out.stripFillerWords = patch.stripFillerWords

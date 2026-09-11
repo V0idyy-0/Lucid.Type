@@ -447,7 +447,7 @@ export default function Onboarding() {
         )}
         {step === 'done' && (
           <DoneStep
-            hotkey={settings.hotkey}
+            hotkey={settings.toggleHotkey}
             launchAtLogin={settings.launchAtLogin}
             onLaunchAtLoginChange={setLaunchAtLogin}
             onFinish={finish}

@@ -2,13 +2,6 @@
  * Renderer-side copy of the settings contract. Mirrors
  * `electron/settings-schema.ts` — keep the two in step.
  */
-/**
- * How the global hotkey drives dictation:
- * - `toggle` — tap once to start, tap again to stop.
- * - `ptt`    — hold to record, release to transcribe (push-to-talk).
- */
-export type DictationMode = 'toggle' | 'ptt'
-
 /** A literal find/replace applied to every finished transcript. */
 export type Replacement = { from: string; to: string }
 
@@ -17,10 +10,14 @@ export const MODEL_IDS = ['tiny.en', 'base.en', 'small.en'] as const
 export type ModelId = (typeof MODEL_IDS)[number]
 
 export type Settings = {
-  /** Global accelerator that reveals the pill and toggles dictation. */
-  hotkey: string
-  /** Whether the hotkey toggles dictation or is held down for push-to-talk. */
-  dictationMode: DictationMode
+  /** Global accelerator that reveals the pill and toggles dictation with a
+   *  tap. Empty falls back to the default (there's always a toggle key). */
+  toggleHotkey: string
+  /** Accelerator held down to record push-to-talk style, release to
+   *  transcribe. Empty means push-to-talk is disabled — unlike the toggle
+   *  hotkey, there's no default to fall back to. Independent of
+   *  `toggleHotkey`; both can be bound and used at the same time. */
+  pttHotkey: string
   /** Fire a synthetic paste after transcription so the text lands in the app. */
   autoPaste: boolean
   /** Drop "um", "uh", "like", "you know" from the transcript. */
@@ -52,8 +49,8 @@ export type Settings = {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  hotkey: 'Alt+Space',
-  dictationMode: 'toggle',
+  toggleHotkey: 'Alt+Space',
+  pttHotkey: '',
   autoPaste: true,
   stripFillerWords: true,
   useLlmPolish: false,

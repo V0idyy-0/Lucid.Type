@@ -28,6 +28,7 @@ import Store from 'electron-store'
 import { uIOhook, UiohookKey, type UiohookKeyboardEvent } from 'uiohook-napi'
 import {
   DEFAULT_SETTINGS,
+  migrateLegacyHotkeySettings,
   sanitizeSettings,
   type ModelId,
   type Replacement,
@@ -164,11 +165,16 @@ function scrubText(text: string): string {
   return out
 }
 
-/** Local Ollama endpoint used for the optional "AI Text Polish" pass. */
-const OLLAMA_URL = 'http://localhost:11434/api/generate'
+/** Local Ollama endpoint used for the optional "AI Text Polish" pass. Uses the
+ *  IPv4 loopback literal, not `localhost` — Node's fetch can resolve
+ *  `localhost` to the IPv6 loopback first, which fails instantly against
+ *  Ollama's IPv4-only default bind and looks identical to "not running". */
+const OLLAMA_URL = 'http://127.0.0.1:11434/api/generate'
 const OLLAMA_MODEL = 'llama3.2:1b'
-/** How long to wait on Ollama before giving up and using the regex cleaner. */
-const OLLAMA_TIMEOUT_MS = 1500
+/** How long to wait on Ollama before giving up and using the regex cleaner.
+ *  Generous enough to tolerate a cold model load (first request after Ollama
+ *  starts/loads the model into memory can take a few seconds). */
+const OLLAMA_TIMEOUT_MS = 4000
 
 /**
  * The editing contract handed to Ollama on every polish pass. Kept terse — a 1B
@@ -217,8 +223,10 @@ function formattingGuidance(appName?: string): string {
  * transcript: resolve mid-sentence self-corrections, strip filler words, and add
  * natural punctuation. `activeAppName` — the app the transcript is about to land
  * in — tunes the output formatting. Entirely best-effort: if Ollama isn't
- * running, is slow, or returns something unusable we abort after 1.5s and return
- * null so the caller falls back to {@link cleanTranscript}.
+ * running, is slow, or returns something unusable we abort after
+ * {@link OLLAMA_TIMEOUT_MS} and return null so the caller falls back to
+ * {@link cleanTranscript}. Every failure is logged (not just swallowed) so a
+ * user-reported "Ollama unavailable" toast is diagnosable from the console.
  */
 async function polishTranscript(raw: string, activeAppName?: string): Promise<string | null> {
   const controller = new AbortController()
@@ -235,14 +243,24 @@ async function polishTranscript(raw: string, activeAppName?: string): Promise<st
       }),
       signal: controller.signal,
     })
-    if (!res.ok) return null
+    if (!res.ok) {
+      // Distinguish "reachable but rejected the request" (e.g. a 404 because
+      // OLLAMA_MODEL isn't pulled under that exact tag) from "unreachable" —
+      // both fall back the same way, but only one of them is diagnosable here.
+      console.warn(`Ollama polish failed: HTTP ${res.status} from ${OLLAMA_URL} (model "${OLLAMA_MODEL}")`)
+      return null
+    }
     const data = (await res.json()) as { response?: unknown }
     // Don't trust the local model's output shape: scrub control/format
     // characters and clamp the length before it re-enters the pipeline.
     const polished = typeof data.response === 'string' ? scrubText(data.response).trim() : ''
     return polished || null
-  } catch {
-    // Ollama not running, aborted by the timeout, or a malformed response.
+  } catch (err) {
+    const reason =
+      (err as Error)?.name === 'AbortError'
+        ? `timed out after ${OLLAMA_TIMEOUT_MS}ms`
+        : ((err as Error)?.message ?? String(err))
+    console.warn(`Ollama polish failed: ${reason}`)
     return null
   } finally {
     clearTimeout(timer)
@@ -472,12 +490,18 @@ let activeHotkey: string | null = null
 
 /** Push-to-talk state: the parsed hotkey we're watching for via the raw
  *  keyboard hook, the modifier keycodes that also end a take, whether the key
- *  is currently held (also used to swallow OS auto-repeat), and whether the
- *  uiohook listener thread is running. */
+ *  is currently held (also used to swallow OS auto-repeat), whether the
+ *  uiohook listener thread is running, and the accelerator (if any) we
+ *  additionally claimed via `globalShortcut` purely so the OS stops
+ *  delivering it to the focused app — see {@link enablePushToTalk}. */
 let pttMatcher: HotkeyMatcher | null = null
 let pttModifierKeycodes = new Set<number>()
 let pttKeyHeld = false
 let uiohookRunning = false
+let pttSuppressedAccelerator: string | null = null
+/** Modifier-only PTT combos only (see {@link HotkeyMatcher}): physical
+ *  modifier keycodes currently held that belong to the combo. */
+let pttHeldModifierKeycodes = new Set<number>()
 
 /** Live settings, or the defaults if the store hasn't been created yet. */
 function settings(): Settings {
@@ -557,14 +581,35 @@ function toggleOverlay() {
 
 // ── Push-to-talk: matching a stored accelerator against raw keyboard events ───
 
-/** A parsed accelerator: the physical key plus the modifier state it requires. */
+/** A parsed accelerator: the physical key plus the modifier state it requires.
+ *  `keycode` is `null` for a modifier-only combo (e.g. "hold Control+Alt,
+ *  no third key") — Electron's `globalShortcut` can't represent that shape,
+ *  but the raw `uiohook` tap can watch for the modifiers alone. */
 interface HotkeyMatcher {
-  keycode: number
+  keycode: number | null
   ctrl: boolean
   alt: boolean
   shift: boolean
   meta: boolean
 }
+
+/** Accelerator tokens that name a modifier rather than a regular key —
+ *  shared between `parseAccelerator`'s "is this combo modifier-only?" check
+ *  and its per-token modifier assignment below. */
+const MODIFIER_TOKENS = new Set([
+  'commandorcontrol',
+  'cmdorctrl',
+  'command',
+  'cmd',
+  'super',
+  'meta',
+  'control',
+  'ctrl',
+  'alt',
+  'option',
+  'altgr',
+  'shift',
+])
 
 const UIOHOOK_KEYS = UiohookKey as Record<string, number>
 
@@ -609,10 +654,37 @@ function tokenKeycode(token: string): number | null {
   return null
 }
 
+/** Fold one modifier token into a matcher's flags (shared by both branches of
+ *  {@link parseAccelerator}). "CommandOrControl" resolves to ⌘ on macOS and
+ *  Ctrl elsewhere; literal "Control"/"Command" always mean that physical key
+ *  regardless of platform. */
+function applyModifierToken(matcher: HotkeyMatcher, mod: string, mac: boolean): void {
+  if (mod === 'commandorcontrol' || mod === 'cmdorctrl') {
+    if (mac) matcher.meta = true
+    else matcher.ctrl = true
+  } else if (mod === 'command' || mod === 'cmd' || mod === 'super' || mod === 'meta') {
+    matcher.meta = true
+  } else if (mod === 'control' || mod === 'ctrl') {
+    matcher.ctrl = true
+  } else if (mod === 'alt' || mod === 'option' || mod === 'altgr') {
+    matcher.alt = true
+  } else if (mod === 'shift') {
+    matcher.shift = true
+  }
+}
+
 /**
- * Parse an Electron accelerator ("Alt+Space", "CommandOrControl+Shift+D") into a
- * {@link HotkeyMatcher}, resolving "CommandOrControl" to ⌘ on macOS and Ctrl
- * elsewhere. Returns null when the final key token isn't one we can match.
+ * Parse an Electron accelerator into a {@link HotkeyMatcher}. Two shapes:
+ *
+ * - Modifier(s) + a regular key ("Alt+Space", "CommandOrControl+Shift+D") —
+ *   the usual case, matched by the exact key going down/up.
+ * - Modifiers only, no regular key ("Control+Alt") — every token names a
+ *   modifier, so there's no trailing key for {@link tokenKeycode} to resolve.
+ *   `keycode` comes back `null`; the caller watches for all the modifiers
+ *   being held at once instead of a specific keycode.
+ *
+ * Returns null when the accelerator is empty, or (in the regular-key shape)
+ * the final token isn't one we can match.
  */
 function parseAccelerator(accelerator: string): HotkeyMatcher | null {
   const parts = accelerator
@@ -621,25 +693,20 @@ function parseAccelerator(accelerator: string): HotkeyMatcher | null {
     .filter(Boolean)
   if (parts.length === 0) return null
 
+  const mac = process.platform === 'darwin'
+  const matcher: HotkeyMatcher = { keycode: null, ctrl: false, alt: false, shift: false, meta: false }
+
+  if (parts.every((p) => MODIFIER_TOKENS.has(p.toLowerCase()))) {
+    for (const mod of parts.map((m) => m.toLowerCase())) applyModifierToken(matcher, mod, mac)
+    return matcher
+  }
+
   const keycode = tokenKeycode(parts[parts.length - 1])
   if (keycode == null) return null
-
-  const mac = process.platform === 'darwin'
-  const matcher: HotkeyMatcher = { keycode, ctrl: false, alt: false, shift: false, meta: false }
+  matcher.keycode = keycode
 
   for (const mod of parts.slice(0, -1).map((m) => m.toLowerCase())) {
-    if (mod === 'commandorcontrol' || mod === 'cmdorctrl') {
-      if (mac) matcher.meta = true
-      else matcher.ctrl = true
-    } else if (mod === 'command' || mod === 'cmd' || mod === 'super' || mod === 'meta') {
-      matcher.meta = true
-    } else if (mod === 'control' || mod === 'ctrl') {
-      matcher.ctrl = true
-    } else if (mod === 'alt' || mod === 'option' || mod === 'altgr') {
-      matcher.alt = true
-    } else if (mod === 'shift') {
-      matcher.shift = true
-    }
+    applyModifierToken(matcher, mod, mac)
   }
   return matcher
 }
@@ -656,15 +723,36 @@ function modifierKeycodes(m: HotkeyMatcher): Set<number> {
   return codes
 }
 
-/** True when a raw keyboard event is exactly the hotkey combo. */
+/** True when a raw keyboard event is exactly the hotkey combo (regular-key
+ *  matchers only — always false for a modifier-only matcher, which is
+ *  engaged via {@link modifiersSatisfied} instead). */
 function eventMatchesHotkey(m: HotkeyMatcher, e: UiohookKeyboardEvent): boolean {
   return (
+    m.keycode != null &&
     e.keycode === m.keycode &&
     e.ctrlKey === m.ctrl &&
     e.altKey === m.alt &&
     e.shiftKey === m.shift &&
     e.metaKey === m.meta
   )
+}
+
+/** One `[left, right]` uiohook keycode pair per modifier a matcher requires —
+ *  used for a modifier-only combo, where "held" means at least one keycode
+ *  from *every* required pair is currently down. */
+function modifierGroups(m: HotkeyMatcher): number[][] {
+  const groups: number[][] = []
+  if (m.ctrl) groups.push([UiohookKey.Ctrl, UiohookKey.CtrlRight])
+  if (m.alt) groups.push([UiohookKey.Alt, UiohookKey.AltRight])
+  if (m.shift) groups.push([UiohookKey.Shift, UiohookKey.ShiftRight])
+  if (m.meta) groups.push([UiohookKey.Meta, UiohookKey.MetaRight])
+  return groups
+}
+
+/** True once every modifier a modifier-only combo requires has at least one
+ *  physical key (left or right) currently held. */
+function modifiersSatisfied(m: HotkeyMatcher, held: ReadonlySet<number>): boolean {
+  return modifierGroups(m).every((group) => group.some((code) => held.has(code)))
 }
 
 /** Hotkey pressed: reveal the pill and tell the renderer to start capturing.
@@ -697,7 +785,42 @@ function onPushToTalkKeyup(e: UiohookKeyboardEvent): void {
   endPushToTalk()
 }
 
-/** Start (or reconfigure) the raw keyboard hook for push-to-talk. */
+/** Modifier-only PTT combo (e.g. "hold Control+Alt"): track which required
+ *  modifier keys are currently down and begin the take once all of them are. */
+function onPushToTalkModifierKeydown(e: UiohookKeyboardEvent): void {
+  if (!pttMatcher || pttMatcher.keycode !== null) return
+  if (!pttModifierKeycodes.has(e.keycode)) return
+  pttHeldModifierKeycodes.add(e.keycode)
+  if (!pttKeyHeld && modifiersSatisfied(pttMatcher, pttHeldModifierKeycodes)) {
+    pttKeyHeld = true
+    beginPushToTalk()
+  }
+}
+
+/** End the take as soon as any required modifier is released — releasing one
+ *  is enough, the user doesn't have to lift every key at once. */
+function onPushToTalkModifierKeyup(e: UiohookKeyboardEvent): void {
+  if (!pttMatcher || pttMatcher.keycode !== null) return
+  if (!pttModifierKeycodes.has(e.keycode)) return
+  pttHeldModifierKeycodes.delete(e.keycode)
+  if (pttKeyHeld && !modifiersSatisfied(pttMatcher, pttHeldModifierKeycodes)) {
+    pttKeyHeld = false
+    endPushToTalk()
+  }
+}
+
+/**
+ * Start (or reconfigure) push-to-talk for `accelerator`. Hold/release timing
+ * comes entirely from the raw `uiohook` keydown/keyup taps (unchanged below).
+ * `uiohook` is listen-only, though — it can watch the key but can't stop the
+ * OS from also delivering it to whatever app is focused, so on its own the
+ * combo leaks into text fields (worse for something like `Alt+Space`, which
+ * macOS already treats as a non-breaking-space input). To stop that, also
+ * claim the exact accelerator with `globalShortcut` (a no-op callback — it
+ * exists purely so the OS treats the combo as claimed and never hands it to
+ * the focused app), the same mechanism the toggle hotkey and the in-recording
+ * `Escape` cancel shortcut already use safely alongside this hook.
+ */
 function enablePushToTalk(accelerator: string): void {
   const matcher = parseAccelerator(accelerator)
   if (!matcher) {
@@ -706,14 +829,24 @@ function enablePushToTalk(accelerator: string): void {
     return
   }
 
+  const modifierOnly = matcher.keycode === null
+
   pttMatcher = matcher
   pttModifierKeycodes = modifierKeycodes(matcher)
+  pttHeldModifierKeycodes = new Set()
   pttKeyHeld = false
 
   uIOhook.removeListener('keydown', onPushToTalkKeydown)
   uIOhook.removeListener('keyup', onPushToTalkKeyup)
-  uIOhook.on('keydown', onPushToTalkKeydown)
-  uIOhook.on('keyup', onPushToTalkKeyup)
+  uIOhook.removeListener('keydown', onPushToTalkModifierKeydown)
+  uIOhook.removeListener('keyup', onPushToTalkModifierKeyup)
+  if (modifierOnly) {
+    uIOhook.on('keydown', onPushToTalkModifierKeydown)
+    uIOhook.on('keyup', onPushToTalkModifierKeyup)
+  } else {
+    uIOhook.on('keydown', onPushToTalkKeydown)
+    uIOhook.on('keyup', onPushToTalkKeyup)
+  }
 
   if (!uiohookRunning) {
     try {
@@ -725,16 +858,47 @@ function enablePushToTalk(accelerator: string): void {
       console.warn(`Push-to-talk: couldn't start the keyboard hook: ${(err as Error).message}`)
     }
   }
+
+  if (modifierOnly) {
+    // Electron's accelerator grammar has no way to express "these modifiers
+    // held, no key" — there's nothing to register, so this combo can never
+    // be claimed from the OS the way a regular key+modifier one can. It'll
+    // keep working via uiohook above, it just may leak into the focused app
+    // (surfaced as a persistent note in Settings, not just this log).
+    pttSuppressedAccelerator = null
+    console.warn(`Push-to-talk: "${accelerator}" is modifier-only and can't be claimed from the OS.`)
+  } else {
+    try {
+      if (globalShortcut.register(accelerator, () => {})) {
+        pttSuppressedAccelerator = accelerator
+      } else {
+        // Already claimed by the OS or another app — push-to-talk still works
+        // via uiohook above, it just won't be swallowed from the focused app.
+        pttSuppressedAccelerator = null
+        console.warn(
+          `Push-to-talk: "${accelerator}" couldn't be claimed from the OS; it may leak into the focused app.`,
+        )
+      }
+    } catch (err) {
+      pttSuppressedAccelerator = null
+      console.warn(`Push-to-talk: invalid accelerator "${accelerator}": ${(err as Error).message}`)
+    }
+  }
+
   activeHotkey = accelerator
 }
 
-/** Tear down the push-to-talk keyboard hook. */
+/** Tear down push-to-talk: the keyboard hook, and the OS-level claim on
+ *  whatever accelerator {@link enablePushToTalk} last suppressed (if any). */
 function disablePushToTalk(): void {
   pttMatcher = null
   pttKeyHeld = false
   pttModifierKeycodes = new Set()
+  pttHeldModifierKeycodes = new Set()
   uIOhook.removeListener('keydown', onPushToTalkKeydown)
   uIOhook.removeListener('keyup', onPushToTalkKeyup)
+  uIOhook.removeListener('keydown', onPushToTalkModifierKeydown)
+  uIOhook.removeListener('keyup', onPushToTalkModifierKeyup)
   if (uiohookRunning) {
     try {
       uIOhook.stop()
@@ -743,51 +907,64 @@ function disablePushToTalk(): void {
     }
     uiohookRunning = false
   }
+  if (pttSuppressedAccelerator) {
+    try {
+      globalShortcut.unregister(pttSuppressedAccelerator)
+    } catch {
+      // Already unregistered.
+    }
+    pttSuppressedAccelerator = null
+  }
 }
 
 /**
- * (Re-)bind the global dictation hotkey to whichever trigger mode is active.
+ * (Re-)bind both dictation hotkeys from settings. Toggle and push-to-talk are
+ * independent — either, both, or (if push-to-talk is unset) just toggle can
+ * be live at once:
  *
- * - `toggle` — `globalShortcut` registers the accelerator (which the focused app
- *   never sees); a tap flips the renderer's recording state. Falls back to the
- *   default accelerator if the requested one is malformed or already claimed.
- * - `ptt` — a raw `uiohook` keyboard hook watches for the combo's keydown/keyup
- *   so the key can be *held*. Unlike `globalShortcut`, the combo is NOT swallowed
- *   from the focused app, so an unobtrusive hotkey works best here.
+ * - Toggle — `globalShortcut` registers the accelerator (which the focused
+ *   app never sees); a tap flips the renderer's recording state. Falls back
+ *   to the default accelerator if the requested one is malformed or already
+ *   claimed. Always bound (empty settings fall back to the default).
+ * - Push-to-talk — a raw `uiohook` keyboard hook watches for the combo's
+ *   keydown/keyup so the key can be *held*, plus a `globalShortcut`
+ *   registration purely to keep the OS from also delivering it to the
+ *   focused app (see {@link enablePushToTalk}). Only bound when
+ *   `pttHotkey` is non-empty — there's no default to fall back to.
  *
- * Whatever was bound before is torn down first so a mode or hotkey edit never
- * leaves a stale binding live.
+ * Whatever was bound before is torn down first so a hotkey edit never leaves
+ * a stale binding live.
  */
 function registerHotkey(): void {
   globalShortcut.unregisterAll()
   activeHotkey = null
-
-  const wanted = settings().hotkey.trim() || DEFAULT_SETTINGS.hotkey
-
-  if (settings().dictationMode === 'ptt') {
-    enablePushToTalk(wanted)
-    return
-  }
-
   disablePushToTalk()
 
+  const { toggleHotkey, pttHotkey } = settings()
+  const wantedToggle = toggleHotkey.trim() || DEFAULT_SETTINGS.toggleHotkey
+
   const candidates =
-    wanted === DEFAULT_SETTINGS.hotkey ? [wanted] : [wanted, DEFAULT_SETTINGS.hotkey]
+    wantedToggle === DEFAULT_SETTINGS.toggleHotkey
+      ? [wantedToggle]
+      : [wantedToggle, DEFAULT_SETTINGS.toggleHotkey]
 
   for (const accelerator of candidates) {
     try {
       if (globalShortcut.register(accelerator, toggleOverlay)) {
         activeHotkey = accelerator
-        if (accelerator !== wanted) {
-          console.warn(`Hotkey "${wanted}" was unavailable; fell back to "${accelerator}".`)
+        if (accelerator !== wantedToggle) {
+          console.warn(`Toggle hotkey "${wantedToggle}" was unavailable; fell back to "${accelerator}".`)
         }
-        return
+        break
       }
     } catch (err) {
-      console.warn(`Invalid accelerator "${accelerator}": ${(err as Error).message}`)
+      console.warn(`Invalid toggle accelerator "${accelerator}": ${(err as Error).message}`)
     }
   }
-  console.warn(`Could not register a global hotkey (wanted "${wanted}").`)
+  if (!activeHotkey) console.warn(`Could not register a toggle hotkey (wanted "${wantedToggle}").`)
+
+  const wantedPtt = pttHotkey.trim()
+  if (wantedPtt) enablePushToTalk(wantedPtt)
 }
 
 /** Parse "#rrggbb" into an [r, g, b] triple; defaults to the stock blue. */
@@ -921,11 +1098,11 @@ function refreshTray(): void {
  * if it changed, repaint the tray, and push the fresh values to every renderer.
  */
 function applySettings(patch: Partial<Settings>): Settings {
-  const clean = sanitizeSettings(patch)
+  const clean = sanitizeSettings(patch, store.store)
   if (Object.keys(clean).length > 0) store.set(clean)
 
   const next = store.store
-  if ('hotkey' in clean || 'dictationMode' in clean) registerHotkey()
+  if ('toggleHotkey' in clean || 'pttHotkey' in clean) registerHotkey()
   if ('launchAtLogin' in clean) syncLoginItem()
   if ('historyLimit' in clean && historyStore) {
     const trimmed = historyStore.get('entries', []).slice(0, Math.max(1, next.historyLimit))
@@ -1568,6 +1745,15 @@ async function rateLimitedTranscribe(wavBytes: Uint8Array): Promise<TranscribeRe
 
 app.whenReady().then(() => {
   store = new Store<Settings>({ defaults: DEFAULT_SETTINGS })
+  // One-time upgrade from the old shared hotkey+mode shape (see the doc
+  // comment on migrateLegacyHotkeySettings) — must run before anything else
+  // reads settings().
+  const legacyPatch = migrateLegacyHotkeySettings(store.store as unknown as Record<string, unknown>)
+  if (legacyPatch) {
+    store.set(legacyPatch)
+    store.delete('hotkey' as keyof Settings)
+    store.delete('dictationMode' as keyof Settings)
+  }
   onboardingStore = new Store<{ completed: boolean }>({
     name: 'onboarding',
     defaults: { completed: false },

@@ -366,3 +366,19 @@ export function isValidShortcut(
 ): boolean {
   return validateShortcut(input, options).ok
 }
+
+/**
+ * True when every token in the shortcut is a modifier — e.g. `"Control+Alt"`,
+ * held with no third key (push-to-talk's alternative to a modifier+key
+ * combo). Such a combo can't be registered with `electron.globalShortcut`
+ * (there's no regular key for it to claim), so it can't be swallowed from
+ * whatever app is focused the way a normal hotkey can — callers use this to
+ * surface that tradeoff in the UI rather than to change validation.
+ */
+export function isModifierOnlyShortcut(
+  input: string | readonly string[],
+  platform?: ShortcutPlatform,
+): boolean {
+  const tokens = toTokens(input, platform ?? detectPlatform())
+  return tokens.length > 0 && tokens.every((t) => t.kind === 'mod')
+}

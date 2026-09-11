@@ -28,21 +28,21 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     file: 'ggml-tiny.en.bin',
     url: `${HF_BASE}/ggml-tiny.en.bin`,
     sizeMB: 75,
-    label: 'Tiny — fastest, least accurate',
+    label: 'Lite — fastest, least accurate',
   },
   'base.en': {
     id: 'base.en',
     file: 'ggml-base.en.bin',
     url: `${HF_BASE}/ggml-base.en.bin`,
     sizeMB: 142,
-    label: 'Base — balanced (default)',
+    label: 'Standard — default',
   },
   'small.en': {
     id: 'small.en',
     file: 'ggml-small.en.bin',
     url: `${HF_BASE}/ggml-small.en.bin`,
     sizeMB: 466,
-    label: 'Small — most accurate, slower',
+    label: 'Pro — deep accuracy, max precision',
   },
 }
 
