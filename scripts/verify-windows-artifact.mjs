@@ -1,4 +1,4 @@
-import { readFile, readdir, mkdtemp, rm } from 'node:fs/promises'
+import { readFile, readdir, mkdtemp, rm, stat } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { tmpdir } from 'node:os'
@@ -100,10 +100,13 @@ const archToBlob = { x64: 'app-64.7z', arm64: 'app-arm64.7z' }
 // installer's own extractor can't handle.
 async function verifyInstaller(arches) {
   const installer = await findInstaller()
+  const installerSize = (await stat(installer)).size
+  console.log(`[debug] installer file size on disk: ${installerSize} bytes`)
   const sevenZa = await get7za()
   const { stdout: outerListing } = await execFileAsync(sevenZa, ['l', '-slt', installer])
-  const { entries: outerEntries } = splitSlt(outerListing)
+  const { summary: outerSummary, entries: outerEntries } = splitSlt(outerListing)
   console.log(`[debug] 7za binary: ${sevenZa}`)
+  console.log(`[debug] installer summary block:\n${outerSummary}`)
   console.log(`[debug] parsed ${outerEntries.length} outer entries: ${outerEntries.map(b => fieldFromBlock(b, 'Path')).join(' | ')}`)
   if (outerEntries.length === 0) {
     console.log(`[debug] raw -slt output follows:\n${outerListing}`)
