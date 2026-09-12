@@ -31,12 +31,10 @@
     "directories": {
       "output": "dist-release"
     },
+    "npmRebuild": false,
     "files": [
       "dist/**/*",
       "dist-electron/**/*"
-    ],
-    "extraResources": [
-      "bin/**/*"
     ],
     "mac": {
       "icon": "build/icon.png",
@@ -45,12 +43,38 @@
       ],
       "identity": "-",
       "hardenedRuntime": false,
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "extraResources": [
+        {
+          "from": "bin/models",
+          "to": "bin/models"
+        },
+        {
+          "from": "bin/whisper-cli",
+          "to": "bin/whisper-cli"
+        }
+      ]
     },
     "win": {
       "icon": "build/icon.png",
       "target": [
-        "nsis"
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "bin/models",
+          "to": "bin/models"
+        },
+        {
+          "from": "bin/whisper-cli-${arch}.exe",
+          "to": "bin/whisper-cli.exe"
+        }
       ]
     },
     "nsis": {
@@ -64,21 +88,31 @@
       "shortcutName": "Lucid Type",
       "uninstallDisplayName": "Lucid Type",
       "deleteAppDataOnUninstall": true,
-      "artifactName": "Lucid-Type-${version}-${os}-${arch}.${ext}"
+      "artifactName": "Lucid-Type-${version}-win.${ext}"
     },
     "linux": {
       "target": [
         "AppImage"
+      ],
+      "extraResources": [
+        {
+          "from": "bin/models",
+          "to": "bin/models"
+        },
+        {
+          "from": "bin/whisper-cli",
+          "to": "bin/whisper-cli"
+        }
       ]
     }
   },
   "dependencies": {
-    "@tailwindcss/vite": "^4.3.3",
     "active-win": "^8.2.1",
     "electron-store": "^11.0.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "uiohook-napi": "^1.5.5"
+    "uiohook-napi": "^1.5.5",
+    "@tailwindcss/vite": "^4.3.3"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

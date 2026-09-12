@@ -56,13 +56,12 @@ Grab the latest build from the
 | Platform | File |
 | --- | --- |
 | macOS (Apple Silicon) | `Lucid-Type-<version>-mac-arm64.dmg` |
-| Windows (x64) | `Lucid-Type-<version>-win-x64.exe` |
-| Windows (ARM64) | `Lucid-Type-<version>-win-arm64.exe` |
+| Windows (x64 & ARM64) | `Lucid-Type-<version>-win.exe` |
 
-On Windows ARM64, download the `win-arm64` installer. On an Intel or AMD
-Windows PC, download `win-x64`; do not rename or interchange the two files.
-The installer creates the `Lucid Type` Start Menu and desktop shortcuts for the
-architecture-specific application.
+The Windows installer is universal: it installs the native build for your CPU
+automatically — the arm64 build on a Windows-on-ARM PC, the x64 build on an
+Intel/AMD PC — and works on both. The installer creates the `Lucid Type` Start
+Menu and desktop shortcuts.
 
 > **Note:** builds are **ad‑hoc signed, not notarized**.
 >
@@ -163,9 +162,10 @@ scripts/
 ### Packaging
 
 `npm run dist` builds for the host platform. CI (`.github/workflows/build.yml`)
-builds macOS on `macos-latest`, Windows x64 on `windows-latest`, and Windows
-ARM64 natively on `windows-11-arm`; pushing a `v*` tag publishes a GitHub
-Release with all the installers attached.
+builds macOS on `macos-latest` and a single universal Windows installer on
+`windows-11-arm` — the arm64 payload compiles natively and the x64 payload
+cross-compiles, so one `Lucid-Type-<version>-win.exe` carries both. Pushing a
+`v*` tag publishes a GitHub Release with the installers attached.
 
 The `ggml-base.en.bin` model is not committed to git — it is fetched by
 `scripts/fetch-model.mjs` (via `postinstall`) and bundled into packaged builds.
