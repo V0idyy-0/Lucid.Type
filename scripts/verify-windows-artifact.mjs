@@ -103,6 +103,11 @@ async function verifyInstaller(arches) {
   const sevenZa = await get7za()
   const { stdout: outerListing } = await execFileAsync(sevenZa, ['l', '-slt', installer])
   const { entries: outerEntries } = splitSlt(outerListing)
+  console.log(`[debug] 7za binary: ${sevenZa}`)
+  console.log(`[debug] parsed ${outerEntries.length} outer entries: ${outerEntries.map(b => fieldFromBlock(b, 'Path')).join(' | ')}`)
+  if (outerEntries.length === 0) {
+    console.log(`[debug] raw -slt output follows:\n${outerListing}`)
+  }
 
   const tmpRoot = await mkdtemp(path.join(tmpdir(), 'lucid-installer-verify-'))
   try {
