@@ -128,6 +128,14 @@ jobs:
         run: npx electron-builder --publish never ${{ matrix.eb_flags }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 7-Zip auto-selects an "ARM64" filter (added in 7-Zip 23.01) when
+          # compressing arm64 executables. electron-builder's bundled NSIS
+          # decompression plugin (nsis7z.dll, vendored from 2019) predates
+          # that filter and can't decode it: the installer completes but
+          # silently fails to extract the big PE/DLL files, leaving a
+          # missing "Lucid Type.exe" on real Windows-on-ARM installs. Force
+          # the old, universally-supported BCJ filter instead.
+          ELECTRON_BUILDER_7Z_FILTER: BCJ
 
       - name: Verify Windows package architectures
         if: matrix.target == 'windows'
