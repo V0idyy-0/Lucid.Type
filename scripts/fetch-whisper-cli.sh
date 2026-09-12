@@ -42,7 +42,7 @@ ensure_src() {
   git clone --depth 1 --branch "$WHISPER_CPP_REF" \
     https://github.com/ggml-org/whisper.cpp "$SRC/src"
 }
-cleanup() { [ -n "$SRC" ] && rm -rf "$SRC"; }
+cleanup() { if [ -n "$SRC" ]; then rm -rf "$SRC"; fi; }
 trap cleanup EXIT
 
 # build_one <out_file> [win_arch]
