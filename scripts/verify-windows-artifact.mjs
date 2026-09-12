@@ -56,8 +56,17 @@ function fieldFromBlock(block, field) {
   return m ? m[1].trim() : null
 }
 
-function findEntry(entries, pathSuffix) {
-  return entries.find(block => fieldFromBlock(block, 'Path') === pathSuffix) ?? null
+// Match by basename, not a full "$PLUGINSDIR/..." path: 7-Zip renders the
+// NSIS plugin-dir separator as "/" on macOS/Linux but "\" on Windows.
+function findEntryByBasename(entries, basename) {
+  return (
+    entries.find(block => {
+      const p = fieldFromBlock(block, 'Path')
+      if (!p) return false
+      const parts = p.split(/[\\/]/)
+      return parts[parts.length - 1] === basename
+    }) ?? null
+  )
 }
 
 async function get7za() {
@@ -99,7 +108,7 @@ async function verifyInstaller(arches) {
   try {
     for (const arch of arches) {
       const blobName = archToBlob[arch]
-      const outerBlock = findEntry(outerEntries, `$PLUGINSDIR/${blobName}`)
+      const outerBlock = findEntryByBasename(outerEntries, blobName)
       if (!outerBlock) {
         throw new Error(`${installer} does not embed ${blobName} for arch ${arch}`)
       }
@@ -109,7 +118,7 @@ async function verifyInstaller(arches) {
       }
       console.log(`${installer}: embeds ${blobName} (${size} bytes)`)
 
-      await execFileAsync(sevenZa, ['e', `-o${tmpRoot}`, installer, `$PLUGINSDIR/${blobName}`, '-r', '-y'])
+      await execFileAsync(sevenZa, ['e', `-o${tmpRoot}`, installer, blobName, '-r', '-y'])
       const blobPath = path.join(tmpRoot, blobName)
 
       const { stdout: innerListing } = await execFileAsync(sevenZa, ['l', '-slt', blobPath])
