@@ -116,6 +116,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify Windows package architecture
+        if: startsWith(matrix.target, 'windows-')
+        run: npm run verify:win -- ${{ endsWith(matrix.target, '-arm64') && 'arm64' || 'x64' }}
+
       # Only upload on a tag build — that's the only run that publishes a
       # release. Plain pushes to main still compile + package to catch
       # breakage, but store nothing.

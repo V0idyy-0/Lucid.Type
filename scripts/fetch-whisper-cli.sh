@@ -80,7 +80,12 @@ if [ "$IS_WIN" = 1 ]; then
     esac
   fi
   if [ "$IS_ARM64_WIN" = 1 ]; then
-    CMAKE_ARGS+=( -T ClangCL )
+    # Select the target explicitly. A native ARM64 runner can still let
+    # CMake choose an x64 default generator platform, which would produce a
+    # helper that Windows ARM64 cannot launch.
+    CMAKE_ARGS+=( -A ARM64 -T ClangCL )
+  else
+    CMAKE_ARGS+=( -A x64 )
   fi
 fi
 

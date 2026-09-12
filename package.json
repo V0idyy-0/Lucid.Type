@@ -19,6 +19,7 @@
     "predist": "node scripts/fetch-model.mjs && bash scripts/fetch-whisper-cli.sh",
     "dist": "npm run build && npm run build:electron && electron-builder",
     "build:win": "npm run build && npm run build:electron && electron-builder --win",
+    "verify:win": "node scripts/verify-windows-artifact.mjs",
     "lint": "oxlint",
     "preview": "vite preview"
   },

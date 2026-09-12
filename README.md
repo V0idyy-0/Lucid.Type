@@ -59,6 +59,11 @@ Grab the latest build from the
 | Windows (x64) | `Lucid-Type-<version>-win-x64.exe` |
 | Windows (ARM64) | `Lucid-Type-<version>-win-arm64.exe` |
 
+On Windows ARM64, download the `win-arm64` installer. On an Intel or AMD
+Windows PC, download `win-x64`; do not rename or interchange the two files.
+The installer creates the `Lucid Type` Start Menu and desktop shortcuts for the
+architecture-specific application.
+
 > **Note:** builds are **ad‑hoc signed, not notarized**.
 >
 > - **macOS:** the first launch is blocked by Gatekeeper. Right‑click the app →
