@@ -19,7 +19,7 @@ concurrency:
 jobs:
   # Cheap sanity check for PRs: compile + lint on a single Linux runner
   # (1x minute multiplier) instead of the full macOS/Windows package
-  # matrix (10x/2x multiplier) that only push/tag builds need.
+  # matrix that only push/tag builds need.
   pr-check:
     name: PR check (lint + build)
     if: github.event_name == 'pull_request'
@@ -56,12 +56,15 @@ jobs:
           - os: macos-latest
             target: macos
             eb_flags: ""
-          - os: windows-latest
-            target: windows-x64
-            eb_flags: "--x64"
+          # One combined Windows installer with BOTH x64 and arm64 payloads.
+          # Built on a native ARM64 runner: arm64 compiles natively (clang-cl),
+          # and x64 cross-compiles and still runs under x64 emulation for the
+          # smoke test. A single installer means a Windows-on-ARM user can never
+          # end up with the "arm64-only, nothing extracted" failure — if ARM64
+          # detection ever misfires, NSIS falls back to the x64 payload.
           - os: windows-11-arm
-            target: windows-arm64
-            eb_flags: "--arm64"
+            target: windows
+            eb_flags: "--x64 --arm64"
 
     steps:
       - name: Checkout
@@ -84,11 +87,26 @@ jobs:
         with:
           path: |
             bin/whisper-cli
-            bin/whisper-cli.exe
-          key: whisper-cli-${{ matrix.target }}-v1.9.3
+            bin/whisper-cli-x64.exe
+            bin/whisper-cli-arm64.exe
+          key: whisper-cli-${{ matrix.target }}-v1.9.3-multiarch
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Add active-win x64 prebuilt for the combined installer
+        if: matrix.target == 'windows'
+        shell: bash
+        run: |
+          # `npm ci` fetched active-win's arm64 prebuilt (this runner is arm64).
+          # Fetch the x64 prebuilt too so the x64 payload of the combined
+          # installer carries its own native binding. Both bindings live
+          # side-by-side under lib/binding/; active-win picks one by process.arch
+          # at runtime, and electron-builder ships both.
+          cd node_modules/active-win
+          npx --yes node-pre-gyp install --target_platform=win32 --target_arch=x64
+          echo "active-win bindings present:"
+          ls lib/binding/
 
       - name: Fetch whisper model
         run: npm run fetch:model
@@ -96,11 +114,6 @@ jobs:
       - name: Build whisper.cpp CLI
         shell: bash
         run: npm run fetch:whisper
-        env:
-          # Tell the script which Windows arch it's targeting explicitly —
-          # PROCESSOR_ARCHITECTURE inside Git Bash on windows-11-arm reports
-          # the WOW64-emulated arch, not the real one, so it can't be trusted.
-          WHISPER_CLI_WIN_ARCH: ${{ contains(matrix.target, 'arm64') && 'arm64' || '' }}
 
       - name: Lint
         if: matrix.target == 'macos'
@@ -116,15 +129,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify Windows package architecture
-        if: startsWith(matrix.target, 'windows-')
-        run: npm run verify:win -- ${{ endsWith(matrix.target, '-arm64') && 'arm64' || 'x64' }}
+      - name: Verify Windows package architectures
+        if: matrix.target == 'windows'
+        run: npm run verify:win -- x64 arm64
 
-      # Only upload on a tag build — that's the only run that publishes a
-      # release. Plain pushes to main still compile + package to catch
-      # breakage, but store nothing.
+      # Upload on tag builds (the release hand-off) and on manual runs
+      # (so a maintainer can inspect a packaged installer on demand).
       - name: Upload Lucid Type artifacts
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: lucid-type-${{ matrix.target }}
@@ -133,7 +145,6 @@ jobs:
             dist-release/Lucid-Type-*.dmg
             dist-release/Lucid-Type-*.exe
           if-no-files-found: ignore
-          # Only needed to hand off to the release job in the same run.
           retention-days: 1
           compression-level: 0
 
