@@ -1,4 +1,4 @@
-import { readFile, readdir, mkdtemp, rm, stat } from 'node:fs/promises'
+import { readFile, mkdtemp, rm, stat, writeFile, readdir as readdirFs } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { tmpdir } from 'node:os'
@@ -56,19 +56,6 @@ function fieldFromBlock(block, field) {
   return m ? m[1].trim() : null
 }
 
-// Match by basename, not a full "$PLUGINSDIR/..." path: 7-Zip renders the
-// NSIS plugin-dir separator as "/" on macOS/Linux but "\" on Windows.
-function findEntryByBasename(entries, basename) {
-  return (
-    entries.find(block => {
-      const p = fieldFromBlock(block, 'Path')
-      if (!p) return false
-      const parts = p.split(/[\\/]/)
-      return parts[parts.length - 1] === basename
-    }) ?? null
-  )
-}
-
 async function get7za() {
   const { getPath7za } = await import('app-builder-lib/out/toolsets/7zip.js')
   return getPath7za()
@@ -76,7 +63,7 @@ async function get7za() {
 
 async function findInstaller() {
   const dir = path.resolve('dist-release')
-  const entries = await readdir(dir)
+  const entries = await readdirFs(dir)
   const match = entries.find(f => /-win\.exe$/.test(f))
   if (!match) {
     throw new Error(`No *-win.exe installer found in ${dir}`)
@@ -84,7 +71,42 @@ async function findInstaller() {
   return path.join(dir, match)
 }
 
-const archToBlob = { x64: 'app-64.7z', arm64: 'app-arm64.7z' }
+const SEVEN_Z_SIGNATURE = Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])
+
+// Find every standalone 7z archive embedded verbatim in the installer.
+// electron-builder's NSIS template embeds each arch's app package as a raw,
+// uncompressed $PLUGINSDIR file (Method: Copy — confirmed by listing the
+// installer on a platform whose 7za does understand the NSIS wrapper), so
+// each occurrence of the 7z file signature marks the start of one complete,
+// self-contained .7z archive. We can't rely on 7za to read the NSIS wrapper
+// itself: the win-arm64 build of 7za electron-builder downloads (confirmed
+// via `-tNsis` erroring out on it) has no NSIS format support at all, even
+// though it reads plain "7z" archives fine — so we find archive boundaries
+// ourselves and let 7za only ever handle standalone .7z files.
+async function findEmbedded7zArchives(installerPath) {
+  const buffer = await readFile(installerPath)
+  const found = []
+  let searchFrom = 0
+  while (true) {
+    const idx = buffer.indexOf(SEVEN_Z_SIGNATURE, searchFrom)
+    if (idx === -1) break
+    // 7z start header: 6-byte signature + 2-byte version + 4-byte header CRC,
+    // then 20 bytes of {NextHeaderOffset, NextHeaderSize, NextHeaderCRC}
+    // (8+8+4), all relative to the end of this 32-byte start header.
+    if (idx + 32 <= buffer.length) {
+      const nextHeaderOffset = buffer.readBigUInt64LE(idx + 12)
+      const nextHeaderSize = buffer.readBigUInt64LE(idx + 20)
+      const archiveSize = 32n + nextHeaderOffset + nextHeaderSize
+      if (archiveSize > 32n && idx + Number(archiveSize) <= buffer.length) {
+        found.push({ offset: idx, size: Number(archiveSize) })
+        searchFrom = idx + Number(archiveSize)
+        continue
+      }
+    }
+    searchFrom = idx + 1
+  }
+  return { buffer, archives: found }
+}
 
 // This is the check that actually matters: electron-builder's pinned 7-Zip
 // compressor (new enough to know about the "ARM64" filter added in 7-Zip
@@ -103,36 +125,25 @@ async function verifyInstaller(arches) {
   const installerSize = (await stat(installer)).size
   console.log(`[debug] installer file size on disk: ${installerSize} bytes`)
   const sevenZa = await get7za()
-  // Force the NSIS archive type explicitly: some platform builds of 7za
-  // (observed on the win-arm64 one electron-builder downloads) don't
-  // auto-detect the NSIS wrapper and instead fall through to reading an
-  // embedded 7z sub-archive directly, making the installer look like it's
-  // missing its other payload.
-  const { stdout: outerListing } = await execFileAsync(sevenZa, ['l', '-slt', '-tNsis', installer])
-  const { summary: outerSummary, entries: outerEntries } = splitSlt(outerListing)
-  console.log(`[debug] 7za binary: ${sevenZa}`)
-  console.log(`[debug] installer summary block:\n${outerSummary}`)
-  console.log(`[debug] parsed ${outerEntries.length} outer entries: ${outerEntries.map(b => fieldFromBlock(b, 'Path')).join(' | ')}`)
-  if (outerEntries.length === 0) {
-    console.log(`[debug] raw -slt output follows:\n${outerListing}`)
+
+  const { buffer, archives } = await findEmbedded7zArchives(installer)
+  console.log(`[debug] found ${archives.length} embedded 7z archive(s): ${archives.map(a => `offset=${a.offset} size=${a.size}`).join(', ')}`)
+  if (archives.length !== arches.length) {
+    throw new Error(
+      `${installer} embeds ${archives.length} 7z archive(s), expected exactly ${arches.length} (one per requested arch: ${arches.join(', ')})`
+    )
   }
 
   const tmpRoot = await mkdtemp(path.join(tmpdir(), 'lucid-installer-verify-'))
+  const seenArches = new Set()
   try {
-    for (const arch of arches) {
-      const blobName = archToBlob[arch]
-      const outerBlock = findEntryByBasename(outerEntries, blobName)
-      if (!outerBlock) {
-        throw new Error(`${installer} does not embed ${blobName} for arch ${arch}`)
+    for (const [i, archive] of archives.entries()) {
+      if (archive.size < 50_000_000) {
+        throw new Error(`${installer}'s embedded archive #${i} is suspiciously small (${archive.size} bytes) — looks truncated`)
       }
-      const size = Number(fieldFromBlock(outerBlock, 'Packed Size'))
-      if (!size || size < 50_000_000) {
-        throw new Error(`${installer}'s ${blobName} is suspiciously small (${size} bytes) — looks truncated`)
-      }
-      console.log(`${installer}: embeds ${blobName} (${size} bytes)`)
-
-      await execFileAsync(sevenZa, ['e', `-o${tmpRoot}`, '-tNsis', installer, blobName, '-r', '-y'])
-      const blobPath = path.join(tmpRoot, blobName)
+      const blobPath = path.join(tmpRoot, `embedded-${i}.7z`)
+      await writeFile(blobPath, buffer.subarray(archive.offset, archive.offset + archive.size))
+      console.log(`${installer}: embedded archive #${i} carved out (${archive.size} bytes)`)
 
       const { stdout: innerListing } = await execFileAsync(sevenZa, ['l', '-slt', '-t7z', blobPath])
       const { summary } = splitSlt(innerListing)
@@ -150,18 +161,27 @@ async function verifyInstaller(arches) {
       }
       console.log(`${blobPath}: compression method OK (${method})`)
 
-      const extractDir = path.join(tmpRoot, arch)
+      const extractDir = path.join(tmpRoot, `extracted-${i}`)
       await execFileAsync(sevenZa, ['x', `-o${extractDir}`, '-t7z', blobPath, '-y'])
-      const files = [
-        path.join(extractDir, 'Lucid Type.exe'),
-        path.join(extractDir, 'resources', 'bin', 'whisper-cli.exe'),
-      ]
-      for (const file of files) {
-        const actual = await peMachine(file)
-        if (actual !== arch) {
-          throw new Error(`Architecture mismatch inside shipped installer: ${file} is ${actual}, expected ${arch}`)
-        }
-        console.log(`${file} (from shipped installer): ${actual}`)
+      const exe = path.join(extractDir, 'Lucid Type.exe')
+      const helper = path.join(extractDir, 'resources', 'bin', 'whisper-cli.exe')
+      const arch = await peMachine(exe)
+      const helperArch = await peMachine(helper)
+      if (helperArch !== arch) {
+        throw new Error(`Architecture mismatch inside shipped installer: ${exe} is ${arch} but ${helper} is ${helperArch}`)
+      }
+      if (!arches.includes(arch)) {
+        throw new Error(`${installer} embeds an unexpected "${arch}" payload (expected one of: ${arches.join(', ')})`)
+      }
+      if (seenArches.has(arch)) {
+        throw new Error(`${installer} embeds more than one "${arch}" payload`)
+      }
+      seenArches.add(arch)
+      console.log(`${exe} (from shipped installer): ${arch}`)
+    }
+    for (const arch of arches) {
+      if (!seenArches.has(arch)) {
+        throw new Error(`${installer} does not embed a "${arch}" payload`)
       }
     }
   } finally {
@@ -191,6 +211,6 @@ for (const arch of arches) {
   }
 }
 
-await verifyInstaller(arches.filter(arch => arch in archToBlob))
+await verifyInstaller(arches.filter(arch => arch in unpackedDir))
 
 console.log(`OK: verified ${arches.join(', ')} artifact(s), including the shipped installer.`)
