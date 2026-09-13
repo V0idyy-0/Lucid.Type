@@ -123,11 +123,11 @@ async function findEmbedded7zArchives(installerPath) {
 async function verifyInstaller(arches) {
   const installer = await findInstaller()
   const installerSize = (await stat(installer)).size
-  console.log(`[debug] installer file size on disk: ${installerSize} bytes`)
+  console.log(`${installer}: ${installerSize} bytes on disk`)
   const sevenZa = await get7za()
 
   const { buffer, archives } = await findEmbedded7zArchives(installer)
-  console.log(`[debug] found ${archives.length} embedded 7z archive(s): ${archives.map(a => `offset=${a.offset} size=${a.size}`).join(', ')}`)
+  console.log(`${installer}: found ${archives.length} embedded 7z archive(s)`)
   if (archives.length !== arches.length) {
     throw new Error(
       `${installer} embeds ${archives.length} 7z archive(s), expected exactly ${arches.length} (one per requested arch: ${arches.join(', ')})`
