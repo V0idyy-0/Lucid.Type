@@ -103,7 +103,12 @@ async function verifyInstaller(arches) {
   const installerSize = (await stat(installer)).size
   console.log(`[debug] installer file size on disk: ${installerSize} bytes`)
   const sevenZa = await get7za()
-  const { stdout: outerListing } = await execFileAsync(sevenZa, ['l', '-slt', installer])
+  // Force the NSIS archive type explicitly: some platform builds of 7za
+  // (observed on the win-arm64 one electron-builder downloads) don't
+  // auto-detect the NSIS wrapper and instead fall through to reading an
+  // embedded 7z sub-archive directly, making the installer look like it's
+  // missing its other payload.
+  const { stdout: outerListing } = await execFileAsync(sevenZa, ['l', '-slt', '-tNsis', installer])
   const { summary: outerSummary, entries: outerEntries } = splitSlt(outerListing)
   console.log(`[debug] 7za binary: ${sevenZa}`)
   console.log(`[debug] installer summary block:\n${outerSummary}`)
@@ -126,10 +131,10 @@ async function verifyInstaller(arches) {
       }
       console.log(`${installer}: embeds ${blobName} (${size} bytes)`)
 
-      await execFileAsync(sevenZa, ['e', `-o${tmpRoot}`, installer, blobName, '-r', '-y'])
+      await execFileAsync(sevenZa, ['e', `-o${tmpRoot}`, '-tNsis', installer, blobName, '-r', '-y'])
       const blobPath = path.join(tmpRoot, blobName)
 
-      const { stdout: innerListing } = await execFileAsync(sevenZa, ['l', '-slt', blobPath])
+      const { stdout: innerListing } = await execFileAsync(sevenZa, ['l', '-slt', '-t7z', blobPath])
       const { summary } = splitSlt(innerListing)
       const method = fieldFromBlock(summary, 'Method')
       if (!method) {
@@ -146,7 +151,7 @@ async function verifyInstaller(arches) {
       console.log(`${blobPath}: compression method OK (${method})`)
 
       const extractDir = path.join(tmpRoot, arch)
-      await execFileAsync(sevenZa, ['x', `-o${extractDir}`, blobPath, '-y'])
+      await execFileAsync(sevenZa, ['x', `-o${extractDir}`, '-t7z', blobPath, '-y'])
       const files = [
         path.join(extractDir, 'Lucid Type.exe'),
         path.join(extractDir, 'resources', 'bin', 'whisper-cli.exe'),
